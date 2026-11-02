@@ -121,9 +121,7 @@ class OpenAICompatibleLLM:
         if settings.mode != "real":
             raise LLMError("OpenAICompatibleLLM requires LLM_MODE=real.")
         if settings.provider not in {"openai", "openai-compatible"}:
-            raise LLMError(
-                "LLM_PROVIDER must be 'openai' or 'openai-compatible' in real mode."
-            )
+            raise LLMError("LLM_PROVIDER must be 'openai' or 'openai-compatible' in real mode.")
         if settings.provider == "openai" and not settings.api_key:
             raise LLMError("LLM_API_KEY is required when LLM_PROVIDER=openai.")
         if not settings.model:
@@ -170,9 +168,7 @@ class OpenAICompatibleLLM:
         except httpx.TimeoutException as exc:
             raise LLMError("The LLM provider request timed out.") from exc
         except httpx.HTTPStatusError as exc:
-            raise LLMError(
-                f"The LLM provider returned HTTP {exc.response.status_code}."
-            ) from exc
+            raise LLMError(f"The LLM provider returned HTTP {exc.response.status_code}.") from exc
         except httpx.RequestError as exc:
             raise LLMError("Could not reach the configured LLM provider.") from exc
         except httpx.HTTPError as exc:
