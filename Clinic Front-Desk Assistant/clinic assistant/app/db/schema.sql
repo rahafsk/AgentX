@@ -1,5 +1,6 @@
 -- Bootstrap schema for the clinic front-desk assistant.
 -- PostgreSQL 13+ provides gen_random_uuid() without an extension.
+-- LangGraph checkpoint tables are created by PostgresSaver.setup() in initialize.py.
 
 CREATE TABLE IF NOT EXISTS doctors (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
