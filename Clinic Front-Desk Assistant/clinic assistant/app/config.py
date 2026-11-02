@@ -126,6 +126,8 @@ class Settings(BaseSettings):
             parsed_url = urlsplit(self.llm_base_url)
             if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
                 raise ValueError("LLM_BASE_URL must be a valid HTTP or HTTPS URL.")
+            if parsed_url.query or parsed_url.fragment:
+                raise ValueError("LLM_BASE_URL must not include a query string or fragment.")
             if self.llm_provider == "openai" and not self.llm_api_key:
                 raise ValueError("LLM_API_KEY is required when LLM_PROVIDER=openai.")
 
