@@ -6,9 +6,9 @@ import os
 from collections.abc import Iterator
 from typing import Any
 
-import psycopg
-import pytest
-from psycopg import Connection
+import psycopg  # type: ignore[import-not-found]
+import pytest  # type: ignore[import-not-found]
+from psycopg import Connection  # type: ignore[import-not-found]
 
 from app.db.initialize import initialize_database
 

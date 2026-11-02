@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import tempfile
+import unittest
 from pathlib import Path
 from types import ModuleType
-
-import pytest
+from unittest.mock import patch
 
 from app.db import initialize as db_initialize
 
@@ -52,32 +53,38 @@ class _FakePsycopg(ModuleType):
         return self.connection
 
 
-def test_initialize_skips_missing_optional_seed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    schema_path = tmp_path / "schema.sql"
-    schema_path.write_text("CREATE TABLE example (id INTEGER);", encoding="utf-8")
-    seed_path = tmp_path / "seed.sql"
-    fake_psycopg = _FakePsycopg()
+class TestInitializeDatabase(unittest.TestCase):
+    def test_initialize_skips_missing_optional_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tmp_path = Path(temporary_directory)
+            schema_path = tmp_path / "schema.sql"
+            schema_path.write_text(
+                "CREATE TABLE example (id INTEGER);", encoding="utf-8"
+            )
+            seed_path = tmp_path / "seed.sql"
+            fake_psycopg = _FakePsycopg()
 
-    monkeypatch.setattr(db_initialize, "_SCHEMA_PATH", schema_path)
-    monkeypatch.setattr(db_initialize, "_SEED_PATH", seed_path)
-    monkeypatch.setattr(db_initialize, "import_module", lambda _: fake_psycopg)
+            with (
+                patch.object(db_initialize, "_SCHEMA_PATH", schema_path),
+                patch.object(db_initialize, "_SEED_PATH", seed_path),
+                patch.object(
+                    db_initialize, "import_module", lambda _: fake_psycopg
+                ),
+            ):
+                db_initialize.initialize_database("postgresql://test/clinic_test")
 
-    db_initialize.initialize_database("postgresql://test/clinic_test")
+            self.assertEqual(
+                fake_psycopg.connection.cursor_instance.statements,
+                ["CREATE TABLE example (id INTEGER);"],
+            )
 
-    assert fake_psycopg.connection.cursor_instance.statements == [
-        "CREATE TABLE example (id INTEGER);"
-    ]
-
-
-def test_initialize_rejects_missing_required_schema(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    missing_schema = tmp_path / "schema.sql"
-    monkeypatch.setattr(db_initialize, "_SCHEMA_PATH", missing_schema)
-
-    with pytest.raises(RuntimeError, match="Required database script not found"):
-        db_initialize.initialize_database("postgresql://test/clinic_test")
+    def test_initialize_rejects_missing_required_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            missing_schema = Path(temporary_directory) / "schema.sql"
+            with patch.object(db_initialize, "_SCHEMA_PATH", missing_schema):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Required database script not found"
+                ):
+                    db_initialize.initialize_database(
+                        "postgresql://test/clinic_test"
+                    )
