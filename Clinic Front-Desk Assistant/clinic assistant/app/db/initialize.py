@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from importlib import import_module
 from pathlib import Path
 
 _DB_DIRECTORY = Path(__file__).resolve().parent
@@ -39,7 +40,7 @@ def initialize_database(database_url: str | None = None) -> None:
     seed_sql = _read_sql(_SEED_PATH)
 
     try:
-        import psycopg
+        psycopg = import_module("psycopg")
     except ImportError as exc:
         raise RuntimeError(
             "psycopg is required to initialize the database; install the project dependencies."
