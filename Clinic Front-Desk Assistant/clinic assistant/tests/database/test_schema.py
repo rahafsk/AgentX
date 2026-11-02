@@ -8,10 +8,10 @@ from threading import Barrier
 from typing import Any
 from uuid import UUID, uuid4
 
-import psycopg
-import pytest
-from psycopg import Connection
-from psycopg.errors import CheckViolation, ExclusionViolation, ForeignKeyViolation, UniqueViolation
+import psycopg  # type: ignore[reportMissingImports]
+import pytest  # type: ignore[reportMissingImports]
+from psycopg import Connection  # type: ignore[reportMissingImports]
+from psycopg.errors import CheckViolation, ExclusionViolation, ForeignKeyViolation, UniqueViolation  # type: ignore[reportMissingImports]
 
 
 def _insert_doctor(connection: Connection[Any], *, active: bool = True) -> UUID:
@@ -84,7 +84,7 @@ def test_adjacent_slots_for_a_doctor_are_allowed(
 
     _insert_slot(database_connection, doctor_id, starts_at)
     _insert_slot(
-        database_connection,
+        database_connection,       
         doctor_id,
         starts_at + timedelta(minutes=30),
     )
@@ -97,12 +97,13 @@ def test_overlapping_slots_for_a_doctor_are_rejected(
     starts_at = _future_start()
     _insert_slot(database_connection, doctor_id, starts_at)
 
-    with pytest.raises(ExclusionViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         _insert_slot(
             database_connection,
             doctor_id,
             starts_at + timedelta(minutes=15),
         )
+    assert exc_info.value.sqlstate == "23P01"  # exclusion_violation
 
 
 def test_a_slot_cannot_have_two_active_bookings(
@@ -112,8 +113,9 @@ def test_a_slot_cannot_have_two_active_bookings(
     slot_id = _insert_slot(database_connection, doctor_id, _future_start())
     _insert_booking(database_connection, slot_id, status="confirmed")
 
-    with pytest.raises(UniqueViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         _insert_booking(database_connection, slot_id, status="pending_approval")
+    assert exc_info.value.sqlstate == "23505"  # unique_violation
 
 
 def test_concurrent_bookings_cannot_reserve_the_same_slot(database_url: str) -> None:
@@ -128,7 +130,9 @@ def test_concurrent_bookings_cannot_reserve_the_same_slot(database_url: str) -> 
             with psycopg.connect(database_url) as connection:
                 barrier.wait(timeout=10)
                 _insert_booking(connection, slot_id)
-        except UniqueViolation:
+        except psycopg.Error as error:
+            if error.sqlstate != "23505":
+                raise
             return "conflict"
         return "booked"
 
@@ -148,8 +152,9 @@ def test_blocked_slot_cannot_be_booked(database_connection: Connection[Any]) -> 
     doctor_id = _insert_doctor(database_connection)
     slot_id = _insert_slot(database_connection, doctor_id, _future_start(), status="blocked")
 
-    with pytest.raises(CheckViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         _insert_booking(database_connection, slot_id)
+    assert exc_info.value.sqlstate == "23514"  # check_violation
 
 
 def test_slot_with_active_booking_cannot_be_blocked(
@@ -159,19 +164,21 @@ def test_slot_with_active_booking_cannot_be_blocked(
     slot_id = _insert_slot(database_connection, doctor_id, _future_start())
     _insert_booking(database_connection, slot_id)
 
-    with pytest.raises(CheckViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         database_connection.execute(
             "UPDATE appointment_slots SET status = 'blocked' WHERE id = %s",
             (slot_id,),
         )
+    assert exc_info.value.sqlstate == "23514"  # check_violation
 
 
 def test_inactive_doctor_slot_cannot_be_booked(database_connection: Connection[Any]) -> None:
     doctor_id = _insert_doctor(database_connection, active=False)
     slot_id = _insert_slot(database_connection, doctor_id, _future_start())
 
-    with pytest.raises(CheckViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         _insert_booking(database_connection, slot_id)
+    assert exc_info.value.sqlstate == "23514"  # check_violation
 
 
 def test_doctor_with_active_booking_cannot_be_deactivated(
@@ -181,11 +188,12 @@ def test_doctor_with_active_booking_cannot_be_deactivated(
     slot_id = _insert_slot(database_connection, doctor_id, _future_start())
     _insert_booking(database_connection, slot_id)
 
-    with pytest.raises(CheckViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         database_connection.execute(
             "UPDATE doctors SET is_active = FALSE WHERE id = %s",
             (doctor_id,),
         )
+    assert exc_info.value.sqlstate == "23514"  # check_violation
 
 
 def test_approval_must_match_the_booking_conversation(
@@ -201,7 +209,7 @@ def test_approval_must_match_the_booking_conversation(
         conversation_id=booking_conversation_id,
     )
 
-    with pytest.raises(ForeignKeyViolation):
+    with pytest.raises(psycopg.Error) as exc_info:
         database_connection.execute(
             """
             INSERT INTO approvals (booking_id, conversation_id, action)
@@ -209,6 +217,7 @@ def test_approval_must_match_the_booking_conversation(
             """,
             (booking_id, other_conversation_id),
         )
+    assert exc_info.value.sqlstate == "23503"  # foreign_key_violation
 
 
 def test_updated_at_triggers_refresh_conversation_and_booking_timestamps(
