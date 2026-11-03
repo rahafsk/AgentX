@@ -5,7 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from app.db import initialize as db_initialize
@@ -53,23 +53,45 @@ class _FakePsycopg(ModuleType):
         return self.connection
 
 
+class _FakePostgresSaver:
+    setup_calls = 0
+
+    @classmethod
+    def from_conn_string(cls, dsn: str) -> _FakePostgresSaver:
+        assert dsn == "postgresql://test/clinic_test"
+        return cls()
+
+    def __enter__(self) -> _FakePostgresSaver:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def setup(self) -> None:
+        type(self).setup_calls += 1
+
+
 class TestInitializeDatabase(unittest.TestCase):
     def test_initialize_skips_missing_optional_seed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             tmp_path = Path(temporary_directory)
             schema_path = tmp_path / "schema.sql"
-            schema_path.write_text(
-                "CREATE TABLE example (id INTEGER);", encoding="utf-8"
-            )
+            schema_path.write_text("CREATE TABLE example (id INTEGER);", encoding="utf-8")
             seed_path = tmp_path / "seed.sql"
             fake_psycopg = _FakePsycopg()
+            _FakePostgresSaver.setup_calls = 0
+
+            def fake_import_module(name: str) -> object:
+                if name == "psycopg":
+                    return fake_psycopg
+                if name == "langgraph.checkpoint.postgres":
+                    return SimpleNamespace(PostgresSaver=_FakePostgresSaver)
+                raise ImportError(name)
 
             with (
                 patch.object(db_initialize, "_SCHEMA_PATH", schema_path),
                 patch.object(db_initialize, "_SEED_PATH", seed_path),
-                patch.object(
-                    db_initialize, "import_module", lambda _: fake_psycopg
-                ),
+                patch.object(db_initialize, "import_module", fake_import_module),
             ):
                 db_initialize.initialize_database("postgresql://test/clinic_test")
 
@@ -77,14 +99,11 @@ class TestInitializeDatabase(unittest.TestCase):
                 fake_psycopg.connection.cursor_instance.statements,
                 ["CREATE TABLE example (id INTEGER);"],
             )
+            self.assertEqual(_FakePostgresSaver.setup_calls, 1)
 
     def test_initialize_rejects_missing_required_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             missing_schema = Path(temporary_directory) / "schema.sql"
             with patch.object(db_initialize, "_SCHEMA_PATH", missing_schema):
-                with self.assertRaisesRegex(
-                    RuntimeError, "Required database script not found"
-                ):
-                    db_initialize.initialize_database(
-                        "postgresql://test/clinic_test"
-                    )
+                with self.assertRaisesRegex(RuntimeError, "Required database script not found"):
+                    db_initialize.initialize_database("postgresql://test/clinic_test")

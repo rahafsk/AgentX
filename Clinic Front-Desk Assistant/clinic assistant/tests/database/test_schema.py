@@ -11,7 +11,6 @@ from uuid import UUID, uuid4
 import psycopg  # type: ignore[reportMissingImports]
 import pytest  # type: ignore[reportMissingImports]
 from psycopg import Connection  # type: ignore[reportMissingImports]
-from psycopg.errors import CheckViolation, ExclusionViolation, ForeignKeyViolation, UniqueViolation  # type: ignore[reportMissingImports]
 
 
 def _insert_doctor(connection: Connection[Any], *, active: bool = True) -> UUID:
@@ -84,7 +83,7 @@ def test_adjacent_slots_for_a_doctor_are_allowed(
 
     _insert_slot(database_connection, doctor_id, starts_at)
     _insert_slot(
-        database_connection,       
+        database_connection,
         doctor_id,
         starts_at + timedelta(minutes=30),
     )

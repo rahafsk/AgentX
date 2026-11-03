@@ -1,5 +1,6 @@
 -- Bootstrap schema for the clinic front-desk assistant.
 -- PostgreSQL 13+ provides gen_random_uuid() without an extension.
+-- LangGraph checkpoint tables are created by PostgresSaver.setup() in initialize.py.
 -- btree_gist enables a GiST exclusion constraint over doctor UUIDs and time ranges.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
