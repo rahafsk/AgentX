@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -13,6 +13,7 @@ from app.db import initialize as db_initialize
 class _FakeCursor:
     def __init__(self) -> None:
         self.statements: list[str] = []
+        self.parameters: list[object | None] = []
 
     def __enter__(self) -> _FakeCursor:
         return self
@@ -20,9 +21,17 @@ class _FakeCursor:
     def __exit__(self, *args: object) -> bool:
         return False
 
-    def execute(self, statement: str, *, prepare: bool) -> None:
-        assert prepare is False
+    def execute(
+        self,
+        statement: str,
+        parameters: object | None = None,
+        *,
+        prepare: bool | None = None,
+    ) -> None:
+        if prepare is not None:
+            assert prepare is False
         self.statements.append(statement)
+        self.parameters.append(parameters)
 
 
 class _FakeConnection:
@@ -55,6 +64,35 @@ class _FakePsycopg(ModuleType):
         return self.connection
 
 
+class _FakePostgresSaver:
+    setup_calls = 0
+
+    @classmethod
+    def from_conn_string(cls, dsn: str) -> _FakePostgresSaver:
+        assert dsn == "postgresql://test/clinic_test"
+        return cls()
+
+    def __enter__(self) -> _FakePostgresSaver:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def setup(self) -> None:
+        type(self).setup_calls += 1
+
+
+def _fake_import_module(fake_psycopg: _FakePsycopg):
+    def import_module(module_name: str) -> object:
+        if module_name == "psycopg":
+            return fake_psycopg
+        if module_name == "langgraph.checkpoint.postgres":
+            return SimpleNamespace(PostgresSaver=_FakePostgresSaver)
+        raise ImportError(module_name)
+
+    return import_module
+
+
 def _write_sql_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -77,14 +115,23 @@ def test_initializer_executes_schema_and_nonempty_seed(
 ) -> None:
     _write_sql_files(tmp_path, monkeypatch)
     fake_psycopg = _FakePsycopg()
-    monkeypatch.setattr(db_initialize, "import_module", lambda _: fake_psycopg)
+    _FakePostgresSaver.setup_calls = 0
+    monkeypatch.setattr(db_initialize, "import_module", _fake_import_module(fake_psycopg))
+    monkeypatch.setenv("APP_ENV", "development")
 
     db_initialize.initialize_database("postgresql://test/clinic_test")
 
     assert fake_psycopg.connection.cursor_instance.statements == [
         "CREATE TABLE example (id INTEGER);",
+        "SELECT set_config('app.environment', %s, true)",
         "INSERT INTO example VALUES (1);",
     ]
+    assert fake_psycopg.connection.cursor_instance.parameters == [
+        None,
+        ("development",),
+        None,
+    ]
+    assert _FakePostgresSaver.setup_calls == 1
 
 
 def test_initializer_skips_empty_seed_file(
@@ -93,13 +140,16 @@ def test_initializer_skips_empty_seed_file(
 ) -> None:
     _write_sql_files(tmp_path, monkeypatch, seed="  \n")
     fake_psycopg = _FakePsycopg()
-    monkeypatch.setattr(db_initialize, "import_module", lambda _: fake_psycopg)
+    _FakePostgresSaver.setup_calls = 0
+    monkeypatch.setattr(db_initialize, "import_module", _fake_import_module(fake_psycopg))
+    monkeypatch.setenv("APP_ENV", "test")
 
     db_initialize.initialize_database("postgresql://test/clinic_test")
 
     assert fake_psycopg.connection.cursor_instance.statements == [
         "CREATE TABLE example (id INTEGER);"
     ]
+    assert _FakePostgresSaver.setup_calls == 1
 
 
 def test_initializer_requires_nonempty_schema(
@@ -127,7 +177,7 @@ def test_initializer_wraps_postgres_errors(
 ) -> None:
     _write_sql_files(tmp_path, monkeypatch)
     fake_psycopg = _FakePsycopg(fail_connect=True)
-    monkeypatch.setattr(db_initialize, "import_module", lambda _: fake_psycopg)
+    monkeypatch.setattr(db_initialize, "import_module", _fake_import_module(fake_psycopg))
 
     with pytest.raises(RuntimeError, match="PostgreSQL initialization failed"):
         db_initialize.initialize_database("postgresql://test/clinic_test")
