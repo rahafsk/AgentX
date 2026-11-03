@@ -7,14 +7,14 @@ fallback wording belong to the clinic-knowledge service.
 from __future__ import annotations
 
 import math
-import os
 import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.config import get_settings
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_DOCUMENTS_DIR = _PROJECT_ROOT / "data" / "clinic_documents"
 _SUPPORTED_SUFFIXES = {".md", ".txt"}
 _TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 _STOP_WORDS = frozenset(
@@ -106,7 +106,11 @@ def _split_text(text: str, *, chunk_size: int, chunk_overlap: int) -> list[str]:
         if end >= len(normalized):
             break
 
-        next_start = max(start + 1, end - chunk_overlap)
+        chunk_length = end - start
+        minimum_progress = max(1, min(chunk_size // 4, chunk_length))
+        maximum_overlap = max(0, chunk_length - minimum_progress)
+        effective_overlap = min(chunk_overlap, maximum_overlap)
+        next_start = end - effective_overlap
         while next_start < len(normalized) and normalized[next_start].isspace():
             next_start += 1
         start = next_start
@@ -134,15 +138,21 @@ class ClinicDocumentRetriever:
             raise ValueError("chunk_size must be greater than zero.")
         if chunk_overlap < 0 or chunk_overlap >= chunk_size:
             raise ValueError("chunk_overlap must be between zero and chunk_size - 1.")
+        settings = get_settings() if documents_dir is None or allow_demo_documents else None
         if allow_demo_documents:
-            app_environment = (os.getenv("APP_ENV") or "production").strip().lower()
-            if app_environment not in {"development", "test"}:
+            assert settings is not None
+            if settings.app_env not in {"development", "test"}:
                 raise ValueError("Demo documents may only be loaded in development or test.")
 
-        root = Path(documents_dir) if documents_dir is not None else _DEFAULT_DOCUMENTS_DIR
+        if documents_dir is None:
+            assert settings is not None
+            root = settings.clinic_documents_path
+        else:
+            root = Path(documents_dir)
         if not root.is_absolute():
             root = _PROJECT_ROOT / root
         self.documents_dir = root.expanduser().resolve()
+        self._root_is_demo = self._contains_demo_directory(self.documents_dir.parts)
         if not self.documents_dir.exists():
             raise FileNotFoundError(
                 f"Clinic documents directory does not exist: {self.documents_dir}"
@@ -225,6 +235,8 @@ class ClinicDocumentRetriever:
                 continue
 
             relative_path = path.relative_to(self.documents_dir)
+            if self._is_hidden_path(relative_path):
+                continue
             if not allow_demo_documents and self._is_demo_path(relative_path):
                 continue
 
@@ -235,6 +247,8 @@ class ClinicDocumentRetriever:
                 raise DocumentLoadError(f"Could not read clinic document: {source}") from exc
 
             source = relative_path.as_posix()
+            if allow_demo_documents and self._root_is_demo:
+                source = f"{_DEMO_DIRECTORY}/{source}"
             for text in _split_text(contents, chunk_size=chunk_size, chunk_overlap=chunk_overlap):
                 frequencies = Counter(_tokenize(text))
                 if frequencies:
@@ -248,10 +262,16 @@ class ClinicDocumentRetriever:
                     )
         return chunks
 
+    def _is_demo_path(self, relative_path: Path) -> bool:
+        return self._contains_demo_directory(
+            (*self.documents_dir.parts, *relative_path.parts)
+        ) or relative_path.name.casefold().startswith(_DEMO_FILE_PREFIX.casefold())
+
     @staticmethod
-    def _is_demo_path(relative_path: Path) -> bool:
-        return (
-            _DEMO_DIRECTORY in relative_path.parts
-            or relative_path.name.startswith(_DEMO_FILE_PREFIX)
-            or any(part.startswith(".") for part in relative_path.parts)
+    def _contains_demo_directory(parts: tuple[str, ...]) -> bool:
+        return any(part.casefold() == _DEMO_DIRECTORY.casefold() for part in parts)
+
+    def _is_hidden_path(self, relative_path: Path) -> bool:
+        return any(
+            part.startswith(".") for part in (*self.documents_dir.parts, *relative_path.parts)
         )
