@@ -4,55 +4,59 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import HumanMessage, AIMessage
 
 
+# Node: chatbot
 def chatbot(state: MessagesState):
     user_message = state["messages"][-1].content
 
     response = AIMessage(
-        content=f"You said: {user_message}"
+        content=f"I received your message: {user_message}"
     )
 
     return {"messages": [response]}
 
 
 def main():
+    # Save checkpoints in memory
     checkpointer = InMemorySaver()
 
+    # Create the graph
     builder = StateGraph(MessagesState)
 
+    # Add node
     builder.add_node("chatbot", chatbot)
+
+    # Connect the graph
     builder.add_edge(START, "chatbot")
     builder.add_edge("chatbot", END)
 
+    # Compile with checkpoint
     graph = builder.compile(checkpointer=checkpointer)
 
+    # Identify the conversation
     config = {
         "configurable": {
             "thread_id": "salwa-chat-1"
         }
     }
 
-    print("Chat started! Type 'exit' to stop.")
+    # First message
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="My name is Salwa")]},
+        config
+    )
 
-    while True:
-        user_input = input("\nYou: ")
+    print("First conversation:")
+    for message in result["messages"]:
+        print(f"{message.type}: {message.content}")
 
-        if user_input.lower() == "exit":
-            print("Chat ended.")
-            break
+    # Second message, same conversation
+    result = graph.invoke(
+        {"messages": [HumanMessage(content="How are you?")]},
+        config
+    )
 
-        result = graph.invoke(
-            {"messages": [HumanMessage(content=user_input)]},
-            config
-        )
-
-        last_message = result["messages"][-1]
-        print("AI:", last_message.content)
-
-    print("\nConversation History:")
-
-    history = graph.get_state(config)
-
-    for message in history.values["messages"]:
+    print("\nResumed conversation:")
+    for message in result["messages"]:
         print(f"{message.type}: {message.content}")
 
 
