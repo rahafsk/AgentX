@@ -1,45 +1,84 @@
 
-from pathlib import Path
 from typing import TypedDict
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.types import interrupt, Command
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 
 
 class SharedState(TypedDict):
-  patient_message: str
-  intent: str
-  decision: str
-  result: str
+    patient_message: str
+    intent: str
+    decision: str
+    result: str
 
 
 """
 Defining Nodes
 """
 
-def classify_request_node(state: SharedState) -> SharedState:
-  # Simulate a fake LLM
-  if "cancel" in state["patient_message"].lower():
-    state["intent"] = "cancel"
-  else:
-    state["intent"] = "other"
 
-  print(f"Detected intent: {state['intent']}")
-  return state
+def classify_request_node(state: SharedState) -> dict[str, str]:
+    # Simulate a fake LLM
+    message = state["patient_message"].lower()
+
+    if "chest pain" in message or "difficulty breathing" in message:
+        intent = "emergency"
+    elif "don't want to cancel" in message or "do not cancel" in message:
+        intent = "other"
+    elif "cancel" in message:
+        intent = "cancel"
+    else:
+        intent = "other"
+
+    print(f"Detected intent: {intent}")
+    return {"intent": intent}
 
 
-def request_approval_node(state: SharedState) -> SharedState:
-  decision = interrupt("Staff approval required. Approve cancellation?")
+def request_approval_node(state: SharedState) -> dict[str, str]:
+    decision = interrupt("Staff approval required. Approve cancellation?")
 
-  state["decision"] = decision
+    decision = str(decision).strip().lower()
 
-  if decision.lower() =
-    state["result"] = "Appointment cancelled successfully."
-  else:
-    state["result"] = "Cancellation rejected. Appointment remains active."
+    if decision == "yes":
+        result = "Appointment cancelled successfully."
+    else:
+        result = "Cancellation rejected. Appointment remains active."
 
-  return state
+    return {
+        "decision": decision,
+        "result": result,
+    }
+
+
+def emergency_response_node(state: SharedState) -> dict[str, str]:
+    return {
+        "result": (
+            "If you may be experiencing an emergency, "
+            "call emergency services immediately."
+        )
+    }
+
+
+def other_request_node(state: SharedState) -> dict[str, str]:
+    return {
+        "result": "This request needs another workflow or clarification."
+    }
+
+
+"""
+Routing Function
+"""
+
+
+def route_intent(state: SharedState) -> str:
+    if state["intent"] == "emergency":
+        return "emergency"
+
+    if state["intent"] == "cancel":
+        return "cancel"
+
+    return "other"
 
 
 """
@@ -51,46 +90,68 @@ graph = StateGraph(SharedState)
 # Register Nodes
 graph.add_node("classify_request_node", classify_request_node)
 graph.add_node("request_approval_node", request_approval_node)
+graph.add_node("emergency_response_node", emergency_response_node)
+graph.add_node("other_request_node", other_request_node)
 
 # Connect them using Edges
 graph.add_edge(START, "classify_request_node")
-graph.add_edge("classify_request_node", "request_approval_node")
+
+# Conditional routing
+graph.add_conditional_edges(
+    "classify_request_node",
+    route_intent,
+    {
+        "emergency": "emergency_response_node",
+        "cancel": "request_approval_node",
+        "other": "other_request_node",
+    },
+)
+
 graph.add_edge("request_approval_node", END)
+graph.add_edge("emergency_response_node", END)
+graph.add_edge("other_request_node", END)
 
 # Compile with Checkpointer
 checkpointer = InMemorySaver()
 workflow = graph.compile(checkpointer=checkpointer)
-
-# Save Graph Diagram
-png_path = Path(__file__).with_suffix(".png")
-png_path.write_bytes(workflow.get_graph().draw_mermaid_png())
-print(f"Graph saved to {png_path}")
 
 
 """
 Running the Workflow
 """
 
-config = {"configurable": {"thread_id": "patient-101"}}
 
-result = workflow.invoke(
-  {
-    "patient_message": "I want to cancel my appointment.",
-    "intent": "",
-    "decision": "",
-    "result": ""
-  },
-  config=config
-)
+def main():
+    patient_message = input("Enter patient's message: ")
 
-print("\nWorkflow paused. Waiting for staff approval...")
+    config = {
+        "configurable": {"thread_id": "patient-101"}
+    }
 
-decision = input("Approve cancellation? (yes/no): ")
+    result = workflow.invoke(
+        {
+            "patient_message": patient_message,
+            "intent": "",
+            "decision": "",
+            "result": "",
+        },
+        config=config,
+    )
 
-# Resume Workflow
-result = workflow.invoke(
-  Command(resume=decision),
-  config=config
-)
+    if workflow.get_state(config).next:
+        print("\nWorkflow paused. Waiting for staff approval...")
 
-print("\nFinal result:", result["result"])
+        decision = input("Approve cancellation? (yes/no): ").strip().lower()
+
+        result = workflow.invoke(
+            Command(resume=decision),
+            config=config,
+        )
+
+    print("\nFinal result:", result["result"])
+
+
+if __name__ == "__main__":
+    main()
+
+
