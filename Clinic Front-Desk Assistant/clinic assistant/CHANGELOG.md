@@ -6,6 +6,7 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 
 ### Added
 
+- Add a local Docker Compose setup for the FastAPI service and PostgreSQL, with health checks, initialization, and persistent database storage.
 - Scaffold the backend package structure for the API, LangGraph workflows, services, repositories, RAG, database, tests, and documentation.
 - Add the FastAPI application entry point and `/health` endpoint.
 - Add a PostgreSQL initialization command that applies the schema and seed SQL files through psycopg.
