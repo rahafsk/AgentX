@@ -8,6 +8,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypedDict
+from urllib.parse import urlsplit
 
 ChatRole = Literal["system", "user", "assistant"]
 
@@ -128,8 +129,11 @@ class OpenAICompatibleLLM:
             raise LLMError("LLM_MODEL is required when LLM_MODE=real.")
         if not settings.base_url:
             raise LLMError("LLM_BASE_URL is required when LLM_MODE=real.")
-        if not settings.base_url.startswith(("https://", "http://")):
+        parsed_base_url = urlsplit(settings.base_url)
+        if parsed_base_url.scheme not in {"https", "http"} or not parsed_base_url.hostname:
             raise LLMError("LLM_BASE_URL must be an HTTP or HTTPS URL.")
+        if parsed_base_url.query or parsed_base_url.fragment:
+            raise LLMError("LLM_BASE_URL must not include a query string or fragment.")
         if not math.isfinite(settings.timeout_seconds) or settings.timeout_seconds <= 0:
             raise LLMError("LLM_TIMEOUT_SECONDS must be a positive number.")
 
