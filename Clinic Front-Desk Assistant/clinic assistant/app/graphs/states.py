@@ -3,8 +3,12 @@
 
 from typing import Annotated, Literal, NotRequired, TypedDict
 
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AnyMessage, RemoveMessage
 from langgraph.graph.message import add_messages
+
+
+# Maximum number of recent messages to retain.
+MAX_MESSAGES = 20
 
 
 Intent = Literal[
@@ -28,9 +32,11 @@ ApprovalStatus = Literal[
 class ConversationState(TypedDict):
     """State shared between conversation workflow nodes."""
 
-    # Shared conversation identifiers
+    # Shared conversation identifier
     conversation_id: str
-    patient_id: str
+
+    # Optional minimal patient reference, if available
+    patient_id: NotRequired[str | None]
 
     # Conversation messages managed by LangGraph
     messages: Annotated[list[AnyMessage], add_messages]
@@ -38,14 +44,32 @@ class ConversationState(TypedDict):
     # Set by the routing node (Member 3)
     intent: NotRequired[Intent]
 
-    # Requested appointment slot, coordinated with Member 3
+    # Requested appointment slot
     requested_slot: NotRequired[str | None]
 
-    # Approval information, coordinated with Member 4
+    # Approval information (Member 4)
     approval_status: NotRequired[ApprovalStatus]
 
     # Final response returned to the API
     response: NotRequired[str]
 
 
-   
+def trim_messages_node(state: ConversationState) -> dict:
+    """Remove older messages and retain only recent conversation history."""
+
+    messages = state.get("messages", [])
+    if len(messages) <= MAX_MESSAGES:
+        return {}
+
+    old_messages = messages[:-MAX_MESSAGES]
+
+    return {
+        "messages": [
+            RemoveMessage(id=message.id)
+            for message in old_messages
+            if message.id is not None
+        ]
+    }
+
+
+
