@@ -7,7 +7,7 @@
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
-
+from pathlib import Path
 
 clinic_documents = [
     {
@@ -74,6 +74,9 @@ graph.add_edge("answer_node", END)
 
 workflow = graph.compile()
 
+png_path = Path(__file__).with_suffix(".png")
+png_path.write_bytes(workflow.get_graph().draw_mermaid_png())
+print(f"Graph saved to {png_path}")
 
 if __name__ == "__main__":
     question = input("Enter your question: ")
