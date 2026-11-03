@@ -29,6 +29,18 @@ uv run uvicorn app.main:app --reload
 - Health check: <http://127.0.0.1:8000/health>
 - Interactive API documentation: <http://127.0.0.1:8000/docs>
 
+## Run with Docker Compose
+
+For local development, copy `.env.example` to `.env`, set a local PostgreSQL password, and make sure `DATABASE_URL` uses `db` as its hostname. Then run:
+
+```sh
+docker compose up --build
+```
+
+Compose starts PostgreSQL, waits for its health check, initializes the application schema and LangGraph checkpoint tables, and then starts the API. The API is available at <http://127.0.0.1:8000/health>. PostgreSQL data is kept in the `postgres_data` named volume; clinic documents are mounted read-only. This setup is for local development, not production deployment.
+
+Stop the services with `docker compose down`. To also delete the local database volume and its contents, run `docker compose down --volumes` only when you intentionally want to discard that development database.
+
 The current health endpoint returns:
 
 ```json
