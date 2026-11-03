@@ -9,9 +9,11 @@ from pathlib import Path
 try:
     load_dotenv = import_module("dotenv").load_dotenv
 except ImportError:
+
     def load_dotenv(*args: object, **kwargs: object) -> bool:
         """Allow initialization to use environment variables without python-dotenv."""
         return False
+
 
 _DB_DIRECTORY = Path(__file__).resolve().parent
 _PROJECT_DIRECTORY = _DB_DIRECTORY.parent.parent
@@ -23,6 +25,10 @@ def _read_sql(path: Path, *, required: bool = False) -> str:
     """Read an initialization script, optionally rejecting an empty file."""
     try:
         statement = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        if not required:
+            return ""
+        raise RuntimeError(f"Required database script not found: {path.name}") from exc
     except OSError as exc:
         raise RuntimeError(f"Could not read database script: {path.name}") from exc
 
