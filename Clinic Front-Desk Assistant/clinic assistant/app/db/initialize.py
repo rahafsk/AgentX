@@ -15,6 +15,10 @@ def _read_sql(path: Path, *, required: bool = False) -> str:
     """Read an initialization script, optionally rejecting an empty file."""
     try:
         statement = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        if not required:
+            return ""
+        raise RuntimeError(f"Required database script not found: {path.name}") from exc
     except OSError as exc:
         raise RuntimeError(f"Could not read database script: {path.name}") from exc
 
@@ -32,7 +36,7 @@ def initialize_database(database_url: str | None = None) -> None:
     ``schema.sql`` must contain idempotent DDL. ``seed.sql`` may be empty; if
     it contains data, make its statements safe to run more than once.
     """
-    dsn = (database_url or os.getenv("DATABASE_URL", "")).strip()
+    dsn = (database_url or os.getenv("DATABASE_URL") or "").strip()
     if not dsn:
         raise RuntimeError("DATABASE_URL must be set before initializing PostgreSQL.")
 
