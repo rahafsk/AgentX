@@ -77,18 +77,18 @@ class ConversationRepository:
 
         return _conversation_from_row(row) if row is not None else None
 
-    def touch(self, conversation_id: UUID) -> Conversation | None:
-        """Refresh updated_at when conversation activity resumes."""
-        with self._connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                """
-                UPDATE conversations
-                SET updated_at = statement_timestamp()
-                WHERE id = %s
-                RETURNING id, thread_id, created_at, updated_at
-                """,
-                (conversation_id,),
-            )
-            row = cursor.fetchone()
+def touch(self, conversation_id: UUID) -> Conversation | None:
+    """Refresh updated_at using the database trigger."""
+    with self._connection.cursor(row_factory=dict_row) as cursor:
+        cursor.execute(
+            """
+            UPDATE conversations
+            SET updated_at = updated_at
+            WHERE id = %s
+            RETURNING id, thread_id, created_at, updated_at
+            """,
+            (conversation_id,),
+        )
+        row = cursor.fetchone()
 
-        return _conversation_from_row(row) if row is not None else None
+    return _conversation_from_row(row) if row is not None else None
