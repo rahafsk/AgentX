@@ -12,6 +12,7 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 - Add deterministic fake and OpenAI-compatible LLM adapters with request timeouts and error handling.
 - Add BM25-style lexical retrieval for approved Markdown and text documents, including source names, no-evidence results, and guarded development-only demo retrieval.
 - Document the target backend architecture, request flow, data contracts, and safety requirements.
+- Add DoctorRepository to retrieve doctors by ID and list active doctors.
 
 ### In progress
 

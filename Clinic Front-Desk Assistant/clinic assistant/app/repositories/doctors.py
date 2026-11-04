@@ -1,4 +1,3 @@
-
 """Parameterized PostgreSQL reads for doctors."""
 
 from __future__ import annotations

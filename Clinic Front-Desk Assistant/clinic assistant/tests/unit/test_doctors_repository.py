@@ -1,4 +1,3 @@
-
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -31,7 +30,11 @@ def test_get_returns_doctor() -> None:
         is_active=True,
         created_at=created_at,
     )
+
     cursor.execute.assert_called_once()
+    query = cursor.execute.call_args.args[0]
+    assert "FROM doctors" in query
+    assert "WHERE id = %s" in query
     assert cursor.execute.call_args.args[1] == (doctor_id,)
 
 
@@ -81,3 +84,4 @@ def test_list_active_returns_doctors() -> None:
     query = cursor.execute.call_args.args[0]
     assert "WHERE is_active = TRUE" in query
     assert "ORDER BY full_name ASC, id ASC" in query
+    assert "FROM doctors" in query
