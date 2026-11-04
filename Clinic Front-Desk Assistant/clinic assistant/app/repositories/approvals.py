@@ -106,38 +106,40 @@ class ApprovalRepository:
         return _approval_from_row(row)
 
     def get(self, approval_id: UUID) -> Approval | None:
-        with self._connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                """
-                SELECT id, booking_id, conversation_id, action, status,
-                       requested_at, decided_at, decided_by, decision_note
-                FROM approvals
-                WHERE id = %s
-                """,
-                (approval_id,),
-            )
-            row = cursor.fetchone()
+        with self._connection.transaction():
+            with self._connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, booking_id, conversation_id, action, status,
+                           requested_at, decided_at, decided_by, decision_note
+                    FROM approvals
+                    WHERE id = %s
+                    """,
+                    (approval_id,),
+                )
+                row = cursor.fetchone()
 
-        return _approval_from_row(row) if row is not None else None
+                return _approval_from_row(row) if row is not None else None
 
     def list_pending(self, *, limit: int = 50) -> list[Approval]:
         if limit < 1:
             raise ValueError("limit must be greater than zero.")
 
-        with self._connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                """
-                SELECT id, booking_id, conversation_id, action, status,
-                       requested_at, decided_at, decided_by, decision_note
-                FROM approvals
-                WHERE status = 'pending'
-                ORDER BY requested_at, id
-                LIMIT %s
-                """,
-                (limit,),
-            )
+        with self._connection.transaction():
+            with self._connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, booking_id, conversation_id, action, status,
+                           requested_at, decided_at, decided_by, decision_note
+                    FROM approvals
+                    WHERE status = 'pending'
+                    ORDER BY requested_at, id
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
 
-            return [_approval_from_row(row) for row in cursor.fetchall()]
+                return [_approval_from_row(row) for row in cursor.fetchall()]
 
     def decide(
         self,
@@ -147,15 +149,47 @@ class ApprovalRepository:
         decided_by: str,
         decision_note: str | None = None,
     ) -> Approval:
-        """Update the approval and corresponding booking atomically."""
+        """Lock the booking first, then decide its approval."""
         if decision not in {"approved", "rejected"}:
             raise ValueError("decision must be 'approved' or 'rejected'.")
 
-        if not decided_by.strip():
+        decided_by = decided_by.strip()
+        if not decided_by:
             raise ValueError("decided_by cannot be empty.")
 
         with self._connection.transaction():
             with self._connection.cursor(row_factory=dict_row) as cursor:
+                # Read the booking ID without locking the approval.
+                cursor.execute(
+                    """
+                    SELECT booking_id
+                    FROM approvals
+                    WHERE id = %s
+                    """,
+                    (approval_id,),
+                )
+                approval_reference = cursor.fetchone()
+
+                if approval_reference is None:
+                    raise ApprovalNotFound("The approval does not exist.")
+
+                booking_id = approval_reference["booking_id"]
+
+                # Lock the booking first, matching create().
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM bookings
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (booking_id,),
+                )
+
+                if cursor.fetchone() is None:
+                    raise ApprovalStateConflict("The approval's booking does not exist.")
+
+                # Lock and read the approval again after obtaining the booking lock.
                 cursor.execute(
                     """
                     SELECT id, booking_id, conversation_id, action, status,
@@ -171,6 +205,11 @@ class ApprovalRepository:
                 if approval_row is None:
                     raise ApprovalNotFound("The approval does not exist.")
 
+                if approval_row["booking_id"] != booking_id:
+                    raise ApprovalContextMismatch(
+                        "The approval's booking changed. Retry the request."
+                    )
+
                 if approval_row["status"] != "pending":
                     raise ApprovalAlreadyDecided("The approval has already been decided.")
 
@@ -181,9 +220,11 @@ class ApprovalRepository:
                 if action == "same_day_booking":
                     expected_booking_status = "pending_approval"
                     booking_status = "confirmed" if decision == "approved" else "rejected"
-                else:
+                elif action == "cancel_booking":
                     expected_booking_status = "confirmed"
                     booking_status = "cancelled" if decision == "approved" else "confirmed"
+                else:
+                    raise ApprovalStateConflict("The approval action is not supported.")
 
                 cursor.execute(
                     """
@@ -194,7 +235,7 @@ class ApprovalRepository:
                     """,
                     (
                         booking_status,
-                        approval_row["booking_id"],
+                        booking_id,
                         expected_booking_status,
                     ),
                 )
@@ -219,7 +260,7 @@ class ApprovalRepository:
                 )
                 row = cursor.fetchone()
 
-        if row is None:
-            raise RuntimeError("PostgreSQL did not return the updated approval.")
+                if row is None:
+                    raise RuntimeError("PostgreSQL did not return the updated approval.")
 
-        return _approval_from_row(row)
+                return _approval_from_row(row)
