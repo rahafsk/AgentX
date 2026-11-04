@@ -1,3 +1,6 @@
+
+"""PostgreSQL repository for conversation metadata."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -21,7 +24,11 @@ def _conversation_from_row(
 
 
 class ConversationRepository:
-    """Persist conversation metadata; LangGraph stores the checkpoint state."""
+    """Persist conversation metadata; LangGraph stores the checkpoint state.
+
+    The caller manages the connection and transaction lifecycle.
+    This repository does not commit or roll back transactions.
+    """
 
     def __init__(self, connection: Connection[Any]) -> None:
         self._connection = connection
@@ -77,18 +84,18 @@ class ConversationRepository:
 
         return _conversation_from_row(row) if row is not None else None
 
-def touch(self, conversation_id: UUID) -> Conversation | None:
-    """Refresh updated_at using the database trigger."""
-    with self._connection.cursor(row_factory=dict_row) as cursor:
-        cursor.execute(
-            """
-            UPDATE conversations
-            SET updated_at = updated_at
-            WHERE id = %s
-            RETURNING id, thread_id, created_at, updated_at
-            """,
-            (conversation_id,),
-        )
-        row = cursor.fetchone()
+    def touch(self, conversation_id: UUID) -> Conversation | None:
+        """Refresh updated_at using the database trigger."""
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """
+                UPDATE conversations
+                SET updated_at = updated_at
+                WHERE id = %s
+                RETURNING id, thread_id, created_at, updated_at
+                """,
+                (conversation_id,),
+            )
+            row = cursor.fetchone()
 
-    return _conversation_from_row(row) if row is not None else None
+        return _conversation_from_row(row) if row is not None else None
