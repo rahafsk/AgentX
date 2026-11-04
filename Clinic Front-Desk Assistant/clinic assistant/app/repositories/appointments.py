@@ -22,6 +22,8 @@ from app.repositories.models import (
     SlotStatus,
 )
 
+MAX_SEARCH_LIMIT = 100
+
 
 def _slot_from_row(row: dict[str, Any]) -> AppointmentSlot:
     """Convert a database row into an AppointmentSlot model."""
@@ -49,15 +51,20 @@ class AppointmentRepository:
         doctor_id: UUID | None = None,
         limit: int = 25,
     ) -> list[AvailableAppointmentSlot]:
-        """List open, unreserved slots for active doctors."""
+        """List open, unreserved slots for active doctors.
+
+        The maximum number of returned slots is 100.
+        """
         _validate_aware_time(starts_at, "starts_at")
         _validate_aware_time(ends_at, "ends_at")
 
         if ends_at <= starts_at:
             raise ValueError("ends_at must be later than starts_at.")
 
-        if limit < 1:
-            raise ValueError("limit must be greater than zero.")
+        if not 1 <= limit <= MAX_SEARCH_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_SEARCH_LIMIT}."
+            )
 
         query = """
             SELECT slot.id, slot.doctor_id,
