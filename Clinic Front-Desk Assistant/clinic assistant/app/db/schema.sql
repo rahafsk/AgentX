@@ -54,10 +54,33 @@ $migration$;
 CREATE TABLE IF NOT EXISTS conversations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     thread_id TEXT NOT NULL UNIQUE,
+    -- Opaque ID from authenticated API context; never a patient name or message.
+    owner_reference TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT conversations_thread_id_not_blank CHECK (BTRIM(thread_id) <> '')
+    CONSTRAINT conversations_thread_id_not_blank CHECK (BTRIM(thread_id) <> ''),
+    CONSTRAINT conversations_owner_reference_not_blank
+        CHECK (owner_reference IS NULL OR BTRIM(owner_reference) <> '')
 );
+
+-- Existing conversations remain unowned until an authenticated migration or service assigns them.
+ALTER TABLE conversations
+    ADD COLUMN IF NOT EXISTS owner_reference TEXT;
+
+DO $migration$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'conversations_owner_reference_not_blank'
+          AND conrelid = 'conversations'::regclass
+    ) THEN
+        ALTER TABLE conversations
+            ADD CONSTRAINT conversations_owner_reference_not_blank
+            CHECK (owner_reference IS NULL OR BTRIM(owner_reference) <> '');
+    END IF;
+END;
+$migration$;
 
 CREATE TABLE IF NOT EXISTS bookings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

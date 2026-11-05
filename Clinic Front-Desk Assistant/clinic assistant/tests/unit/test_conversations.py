@@ -1,4 +1,3 @@
-
 """Unit tests for the PostgreSQL conversation repository."""
 
 from __future__ import annotations
@@ -36,6 +35,14 @@ class _FakeCursor:
         return self.row
 
 
+class _FakeTransaction:
+    def __enter__(self) -> _FakeTransaction:
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
 class _FakeConnection:
     """A fake connection used by repository unit tests."""
 
@@ -44,6 +51,9 @@ class _FakeConnection:
 
     def cursor(self, *, row_factory: object | None = None) -> _FakeCursor:
         return self.cursor_instance
+
+    def transaction(self) -> _FakeTransaction:
+        return _FakeTransaction()
 
 
 def _conversation_row(conversation_id: UUID) -> dict[str, object]:
@@ -56,6 +66,7 @@ def _conversation_row(conversation_id: UUID) -> dict[str, object]:
         "thread_id": str(conversation_id),
         "created_at": now,
         "updated_at": now,
+        "owner_reference": "opaque-test-owner",
     }
 
 
@@ -71,14 +82,16 @@ def test_create_conversation(monkeypatch) -> None:
     fake_connection = _FakeConnection(_conversation_row(conversation_id))
     repository = ConversationRepository(fake_connection)
 
-    conversation = repository.create()
+    conversation = repository.create("opaque-test-owner")
 
     assert conversation.id == conversation_id
     assert conversation.thread_id == str(conversation_id)
+    assert conversation.owner_reference == "opaque-test-owner"
     assert "INSERT INTO conversations" in fake_connection.cursor_instance.statement
     assert fake_connection.cursor_instance.parameters == (
         conversation_id,
         str(conversation_id),
+        "opaque-test-owner",
     )
 
 
@@ -111,6 +124,23 @@ def test_get_by_thread_id() -> None:
     assert fake_connection.cursor_instance.parameters == (thread_id,)
 
 
+def test_get_for_owner_scopes_lookup_to_owner() -> None:
+    conversation_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    fake_connection = _FakeConnection(_conversation_row(conversation_id))
+    repository = ConversationRepository(fake_connection)
+
+    conversation = repository.get_for_owner(conversation_id, "opaque-test-owner")
+
+    assert conversation is not None
+    assert conversation.owner_reference == "opaque-test-owner"
+    assert "WHERE id = %s AND owner_reference = %s" in fake_connection.cursor_instance.statement
+    assert fake_connection.cursor_instance.parameters == (
+        conversation_id,
+        "opaque-test-owner",
+    )
+
+
 def test_touch_conversation() -> None:
     conversation_id = UUID("12345678-1234-5678-1234-567812345678")
 
@@ -124,6 +154,23 @@ def test_touch_conversation() -> None:
     assert "UPDATE conversations" in fake_connection.cursor_instance.statement
     assert "RETURNING" in fake_connection.cursor_instance.statement
     assert fake_connection.cursor_instance.parameters == (conversation_id,)
+
+
+def test_touch_for_owner_is_scoped() -> None:
+    conversation_id = UUID("12345678-1234-5678-1234-567812345678")
+
+    fake_connection = _FakeConnection(_conversation_row(conversation_id))
+    repository = ConversationRepository(fake_connection)
+
+    conversation = repository.touch_for_owner(conversation_id, "opaque-test-owner")
+
+    assert conversation is not None
+    assert conversation.id == conversation_id
+    assert "WHERE id = %s AND owner_reference = %s" in fake_connection.cursor_instance.statement
+    assert fake_connection.cursor_instance.parameters == (
+        conversation_id,
+        "opaque-test-owner",
+    )
 
 
 def test_get_returns_none_when_conversation_does_not_exist() -> None:
