@@ -2,7 +2,7 @@
 
 A **backend REST API** for the clinic's existing chat client. The planned system uses FastAPI, LangGraph, and PostgreSQL to support conversations, appointment requests, staff approvals, and answers grounded in clinic-approved information. No website or frontend is included.
 
-> **Status: Work in progress.** At present, the implemented API endpoint is `GET /health`. Conversation, appointment, approval, graph, repository, RAG, and database-schema modules are still under development. See [`docs/architecture.md`](docs/architecture.md) for the target design.
+> **Status: Work in progress.** The API includes conversation, appointment, and staff-approval workflows backed by PostgreSQL and LangGraph. Production identity-provider integration and deployment hardening remain host responsibilities. See [`docs/architecture.md`](docs/architecture.md) for component contracts.
 
 ## Requirements
 
@@ -23,11 +23,14 @@ uv sync --locked --extra dev
 From the project directory (the one containing `pyproject.toml`):
 
 ```sh
+uv run python -m app.db.initialize
 uv run uvicorn app.main:app --reload
 ```
 
-- Health check: <http://127.0.0.1:8000/health>
+- Readiness check: <http://127.0.0.1:8000/health>
 - Interactive API documentation: <http://127.0.0.1:8000/docs>
+
+Run the database initializer as a deployment/setup step, not on each API process startup. The readiness endpoint returns `503` until PostgreSQL services are configured.
 
 ## Run with Docker Compose
 
@@ -37,11 +40,11 @@ For local development, copy `.env.example` to `.env`, set a local PostgreSQL pas
 docker compose up --build
 ```
 
-Compose starts PostgreSQL, waits for its health check, initializes the application schema and LangGraph checkpoint tables, and then starts the API. The API is available at <http://127.0.0.1:8000/health>. PostgreSQL data is kept in the `postgres_data` named volume; clinic documents are mounted read-only. This setup is for local development, not production deployment.
+Compose starts PostgreSQL, waits for its health check, runs a one-shot `db-init` migration service, and then starts the API. Routine API restarts do not rerun schema DDL. The API is available at <http://127.0.0.1:8000/health>. PostgreSQL data is kept in the `postgres_data` named volume; clinic documents are mounted read-only. This setup is for local development, not production deployment.
 
 Stop the services with `docker compose down`. To also delete the local database volume and its contents, run `docker compose down --volumes` only when you intentionally want to discard that development database.
 
-The current health endpoint returns:
+When services are ready, the readiness endpoint returns:
 
 ```json
 {"status":"ok"}
@@ -51,7 +54,9 @@ The current health endpoint returns:
 
 `.env.example` lists the planned environment variables. Copy it to `.env` for local development and replace placeholder values as needed. Never commit `.env`, real credentials, or API keys. The fake LLM mode is intended for local tests and CI; real LLM requests require a configured OpenAI-compatible endpoint and must use a timeout.
 
-Database initialization is not ready yet: `app/db/schema.sql` and `app/db/seed.sql` still need their clinic database definitions. Do not point development or test commands at a production database.
+Conversation routes derive ownership from a trusted authentication context, and approval routes require a separate trusted staff context. The embedding host must supply `owner_reference_resolver` and `staff_reference_resolver` when composing the app; caller-provided `X-Owner-Reference` and `decided_by` values are not accepted as identity. Without the resolvers, protected routes fail with `401`.
+
+Do not point development or test commands at a production database. Database tests require an explicitly disposable PostgreSQL database with `APP_ENV=test`.
 
 ## Safety requirements
 

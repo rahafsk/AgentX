@@ -14,12 +14,13 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import ConnectionPool
 
 from app.graphs.states import ConversationState
-from app.graphs.workflows import build_workflow
+from app.graphs.workflows import APPROVAL_HANDLER, build_workflow
 from app.rag import RetrievedChunk
 from app.repositories.appointments import AppointmentRepository
 from app.repositories.approvals import ApprovalRepository
-from app.repositories.conversations import ConversationRepository
-from app.repositories.models import Approval, ApprovalDecision, Conversation
+from app.repositories.bookings import BookingRepository
+from app.repositories.conversations import ConversationRepository, ConversationRequestClaim
+from app.repositories.models import Approval, ApprovalDecision, Booking, Conversation
 from app.services.appointments import AppointmentService
 from app.services.approvals import ApprovalService
 from app.services.clinic_knowledge import ClinicKnowledgeService
@@ -43,6 +44,45 @@ class _PooledConversationStore:
     def create(self, owner_reference: str, request_id: UUID) -> Conversation:
         with self._pool.connection() as connection:
             return ConversationRepository(connection).create(owner_reference, request_id)
+
+    def create_idempotent(
+        self,
+        owner_reference: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation:
+        with self._pool.connection() as connection:
+            return ConversationRepository(connection).create_idempotent(
+                owner_reference,
+                idempotency_key,
+                request_hash,
+            )
+
+    def claim_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        request_hash: str,
+    ) -> ConversationRequestClaim:
+        with self._pool.connection() as connection:
+            return ConversationRepository(connection).claim_request(
+                conversation_id,
+                request_id,
+                request_hash,
+            )
+
+    def complete_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        result: dict[str, Any],
+    ) -> None:
+        with self._pool.connection() as connection:
+            ConversationRepository(connection).complete_request(
+                conversation_id,
+                request_id,
+                result,
+            )
 
     def get(self, conversation_id: UUID) -> Conversation | None:
         with self._pool.connection() as connection:
@@ -79,6 +119,10 @@ class _PooledApprovalStore:
         with self._pool.connection() as connection:
             return ApprovalRepository(connection).list_pending(limit=limit)
 
+    def get(self, approval_id: UUID) -> Approval | None:
+        with self._pool.connection() as connection:
+            return ApprovalRepository(connection).get(approval_id)
+
     def decide(
         self,
         approval_id: UUID,
@@ -94,6 +138,15 @@ class _PooledApprovalStore:
                 decided_by=decided_by,
                 decision_note=decision_note,
             )
+
+
+class _PooledBookingStore:
+    def __init__(self, pool: ConnectionPool) -> None:
+        self._pool = pool
+
+    def get(self, booking_id: UUID) -> Booking | None:
+        with self._pool.connection() as connection:
+            return BookingRepository(connection).get(booking_id)
 
 
 def _workflow(pool: ConnectionPool, checkpointer: AsyncPostgresSaver) -> Any:
@@ -195,7 +248,10 @@ async def test_same_day_booking_resumes_to_final_booking_status(database_url: st
 
                 assert pending_state["booking_status"] == "pending_approval"
                 assert pending_state["approval_status"] == "pending"
-                assert "__interrupt__" in pending_state
+                pending_snapshot = await workflow.aget_state(
+                    {"configurable": {"thread_id": thread_id}}
+                )
+                assert pending_snapshot.next == (APPROVAL_HANDLER,)
                 booking_id = UUID(str(pending_state["booking_id"]))
                 approval_id = UUID(str(pending_state["approval_id"]))
                 pending_approval = await asyncio.to_thread(lambda: _approval(pool, approval_id))
@@ -210,7 +266,12 @@ async def test_same_day_booking_resumes_to_final_booking_status(database_url: st
                     _PooledConversationStore(pool),
                     workflow,
                 )
-                approvals = ApprovalService(_PooledApprovalStore(pool), conversations)
+                approvals = ApprovalService(
+                    _PooledApprovalStore(pool),
+                    _PooledBookingStore(pool),
+                    _PooledConversationStore(pool),
+                    conversations,
+                )
                 decided, final_state = await approvals.decide(
                     approval_id,
                     "approved",
@@ -254,7 +315,10 @@ async def test_same_day_booking_resumes_to_final_booking_status(database_url: st
                     booking_id=future_booking.id,
                 )
                 assert cancellation_state["approval_status"] == "pending"
-                assert "__interrupt__" in cancellation_state
+                cancellation_snapshot = await workflow.aget_state(
+                    {"configurable": {"thread_id": thread_id}}
+                )
+                assert cancellation_snapshot.next == (APPROVAL_HANDLER,)
                 cancel_approval_id = UUID(str(cancellation_state["approval_id"]))
                 cancel_decision, cancelled_state = await approvals.decide(
                     cancel_approval_id,

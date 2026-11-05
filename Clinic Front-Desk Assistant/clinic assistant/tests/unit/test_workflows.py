@@ -152,6 +152,56 @@ async def test_normal_appointment_completes_without_approval() -> None:
 
 
 @pytest.mark.parametrize(
+    ("update", "expected_fragment", "expected_interrupt"),
+    [
+        ({"approval_status": "pending"}, "waiting for staff", True),
+        ({"approval_status": "not_required"}, "clinic information", False),
+    ],
+)
+async def test_appointment_node_supplies_safe_response_when_handler_text_is_empty(
+    update: Mapping[str, Any],
+    expected_fragment: str,
+    expected_interrupt: bool,
+) -> None:
+    async def appointment_handler(state: ConversationState) -> Mapping[str, Any]:
+        return {**update, "response": ""}
+
+    workflow = build_workflow(
+        knowledge_service=_never_called_service(),
+        appointment_handler=appointment_handler,
+        checkpointer=InMemorySaver(),
+    )
+
+    result = await workflow.ainvoke(
+        _state("I need an appointment."),
+        _config(f"empty-appointment-response-{expected_fragment}"),
+    )
+
+    assert expected_fragment in result["response"].lower()
+    assert ("__interrupt__" in result) is expected_interrupt
+
+
+async def test_appointment_handler_exception_is_not_returned_as_successful_fallback() -> None:
+    async def failing_appointment_handler(state: ConversationState) -> Mapping[str, Any]:
+        raise RuntimeError("private database diagnostic")
+
+    workflow = build_workflow(
+        knowledge_service=_never_called_service(),
+        appointment_handler=failing_appointment_handler,
+        checkpointer=InMemorySaver(),
+    )
+
+    result = await workflow.ainvoke(
+        _state("I need an appointment."),
+        _config("appointment-node-failure"),
+    )
+
+    assert result["workflow_error"] == "appointment_handler_failed"
+    assert "couldn't complete" in result["response"]
+    assert "private database diagnostic" not in result["response"]
+
+
+@pytest.mark.parametrize(
     ("text", "expected_intent"),
     [
         ("I need to cancel my appointment.", "cancel_appointment"),

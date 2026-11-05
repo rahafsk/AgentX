@@ -90,6 +90,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS conversations_owner_creation_request_idx
     ON conversations (owner_reference, creation_request_id)
     WHERE creation_request_id IS NOT NULL;
 
+-- Durable idempotency for conversation creation, scoped to the authenticated owner.
+CREATE TABLE IF NOT EXISTS conversation_idempotency (
+    owner_reference TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    conversation_id UUID NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (owner_reference, idempotency_key),
+    CONSTRAINT conversation_idempotency_owner_not_blank
+        CHECK (BTRIM(owner_reference) <> ''),
+    CONSTRAINT conversation_idempotency_key_not_blank
+        CHECK (BTRIM(idempotency_key) <> ''),
+    CONSTRAINT conversation_idempotency_hash_not_blank
+        CHECK (BTRIM(request_hash) <> '')
+);
+
+CREATE INDEX IF NOT EXISTS conversation_idempotency_conversation_idx
+    ON conversation_idempotency (conversation_id);
+
+-- Keep turn idempotency independent of the bounded LangGraph message history.
+CREATE TABLE IF NOT EXISTS conversation_request_results (
+    conversation_id UUID NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+    request_id UUID NOT NULL,
+    request_hash TEXT NOT NULL,
+    result JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    PRIMARY KEY (conversation_id, request_id),
+    CONSTRAINT conversation_request_hash_not_blank CHECK (BTRIM(request_hash) <> ''),
+    CONSTRAINT conversation_request_completion_consistent CHECK (
+        (result IS NULL AND completed_at IS NULL)
+        OR (result IS NOT NULL AND completed_at IS NOT NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS bookings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     slot_id UUID NOT NULL REFERENCES appointment_slots (id) ON DELETE RESTRICT,

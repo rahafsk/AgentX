@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.api.dependencies import IdempotencyKey, OwnerReferenceDependency
 from app.repositories.appointments import MAX_SEARCH_LIMIT
+from app.repositories.conversations import IdempotencyKeyConflict
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import ApprovalStatus, AvailableAppointmentSlot, BookingStatus
 from app.services.appointments import DEFAULT_SEARCH_LIMIT
@@ -244,6 +245,11 @@ async def create_booking(
         )
     except ConversationNotFound as exc:
         raise HTTPException(status_code=404, detail="Conversation not found.") from exc
+    except IdempotencyKeyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was reused with different request content.",
+        ) from exc
     except ConversationProcessingError as exc:
         raise HTTPException(
             status_code=503,
@@ -304,6 +310,11 @@ async def request_cancellation(
         )
     except ConversationNotFound as exc:
         raise HTTPException(status_code=404, detail="Conversation not found.") from exc
+    except IdempotencyKeyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was reused with different request content.",
+        ) from exc
     except ConversationProcessingError as exc:
         raise HTTPException(
             status_code=503,

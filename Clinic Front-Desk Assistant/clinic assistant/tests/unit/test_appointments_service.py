@@ -163,6 +163,13 @@ class _FakeApprovalRepository:
         self.approval = approval
         self.error = error
         self.create_calls: list[dict[str, Any]] = []
+        self.get_calls: list[UUID] = []
+
+    def get(self, approval_id: UUID) -> Approval | None:
+        self.get_calls.append(approval_id)
+        if self.approval is not None and self.approval.id == approval_id:
+            return self.approval
+        return None
 
     def create(
         self,

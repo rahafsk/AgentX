@@ -155,6 +155,19 @@ class AppointmentService:
             request_id = _require_uuid(request_id, "request_id")
         self._require_conversation(conversation_id, owner_reference)
 
+        if request_id is not None:
+            existing_approval = self._approvals.get(request_id)
+            if existing_approval is not None:
+                if (
+                    existing_approval.booking_id != booking_id
+                    or existing_approval.conversation_id != conversation_id
+                    or existing_approval.action != "cancel_booking"
+                ):
+                    raise ApprovalContextMismatch(
+                        "The request ID was already used for another approval."
+                    )
+                return existing_approval
+
         booking = self._bookings.get(booking_id)
         if booking is None:
             raise BookingNotFound("The booking does not exist.")

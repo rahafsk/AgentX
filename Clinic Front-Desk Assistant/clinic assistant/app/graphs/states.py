@@ -49,6 +49,7 @@ class ConversationState(TypedDict):
 
     # Requested appointment slot
     requested_slot: NotRequired[str | None]
+    selected_slot_id: NotRequired[str | None]
 
     # Structured appointment request and handler results.
     requested_booking_id: NotRequired[str | None]
@@ -56,6 +57,8 @@ class ConversationState(TypedDict):
     booking_status: NotRequired[BookingStatus | None]
     approval_id: NotRequired[str | None]
     workflow_error: NotRequired[str | None]
+    available_slots: NotRequired[list[dict[str, str]]]
+    available_bookings: NotRequired[list[dict[str, str]]]
 
     # Approval information (Member 4)
     approval_status: NotRequired[ApprovalStatus]

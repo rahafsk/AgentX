@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Annotated, Protocol, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.dependencies import IdempotencyKey, OwnerReferenceDependency
+from app.repositories.conversations import IdempotencyKeyConflict
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import Conversation
+from app.services.conversations import ConversationProcessingError
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+
+def _create_request_hash(request: Request, body: bytes) -> str:
+    """Hash request content without persisting patient-provided text."""
+    digest = hashlib.sha256()
+    digest.update(request.method.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(request.url.path.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(body)
+    return digest.hexdigest()
 
 
 class ConversationServiceProtocol(Protocol):
@@ -22,7 +36,9 @@ class ConversationServiceProtocol(Protocol):
     async def create_conversation(
         self,
         owner_reference: str,
-        request_id: UUID,
+        *,
+        idempotency_key: str,
+        request_hash: str,
     ) -> Conversation: ...
 
     async def get_conversation(
@@ -62,6 +78,8 @@ class ConversationResponse(BaseModel):
 
 class MessageRequest(BaseModel):
     """A patient message sent to an existing conversation."""
+
+    model_config = ConfigDict(extra="forbid")
 
     message: str = Field(min_length=1, max_length=4000)
 
@@ -103,12 +121,24 @@ ConversationServiceDependency = Annotated[
     status_code=status.HTTP_201_CREATED,
 )
 async def create_conversation(
+    request: Request,
     service: ConversationServiceDependency,
     owner_reference: OwnerReferenceDependency,
-    request_id: IdempotencyKey,
+    idempotency_key: IdempotencyKey,
 ) -> ConversationResponse:
-    """Create a conversation whose ID stays stable as the LangGraph thread ID."""
-    conversation = await service.create_conversation(owner_reference, request_id)
+    """Create or replay a conversation using its durable owner-scoped key."""
+    body = await request.body()
+    try:
+        conversation = await service.create_conversation(
+            owner_reference,
+            idempotency_key=str(idempotency_key),
+            request_hash=_create_request_hash(request, body),
+        )
+    except IdempotencyKeyConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency-Key was reused with different request content.",
+        ) from exc
     return ConversationResponse.from_conversation(conversation)
 
 
@@ -152,6 +182,16 @@ async def send_message(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found.",
+        ) from exc
+    except IdempotencyKeyConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency-Key was reused with different request content.",
+        ) from exc
+    except ConversationProcessingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The message could not be resumed; retry with the same Idempotency-Key.",
         ) from exc
     except RuntimeError as exc:
         raise HTTPException(

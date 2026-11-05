@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, RemoveMessage
 from langgraph.types import Command
 
 from app.graphs.states import MAX_MESSAGES
+from app.repositories.conversations import ConversationRequestClaim, IdempotencyKeyConflict
 from app.repositories.errors import ApprovalNotFound, ConversationNotFound
 from app.repositories.models import Conversation
 from app.services.conversations import (
@@ -38,11 +39,20 @@ def _conversation(owner_reference: str = _OWNER) -> Conversation:
 class _FakeRepository:
     def __init__(self, conversations: list[Conversation] | None = None) -> None:
         self._conversations = {item.id: item for item in conversations or []}
-        self.created_owners: list[tuple[str, UUID]] = []
+        self.created_owners: list[tuple[str, str, str]] = []
         self.touched: list[tuple[UUID, str]] = []
+        self.request_results: dict[tuple[UUID, UUID], tuple[str, dict[str, Any] | None]] = {}
 
     def create(self, owner_reference: str, request_id: UUID) -> Conversation:
-        self.created_owners.append((owner_reference, request_id))
+        return self.create_idempotent(owner_reference, str(request_id), "create-hash")
+
+    def create_idempotent(
+        self,
+        owner_reference: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation:
+        self.created_owners.append((owner_reference, idempotency_key, request_hash))
         conversation = _conversation(owner_reference)
         conversation = Conversation(
             id=conversation.id,
@@ -50,10 +60,34 @@ class _FakeRepository:
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
             owner_reference=conversation.owner_reference,
-            creation_request_id=request_id,
         )
         self._conversations[conversation.id] = conversation
         return conversation
+
+    def claim_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        request_hash: str,
+    ) -> ConversationRequestClaim:
+        key = (conversation_id, request_id)
+        current = self.request_results.get(key)
+        if current is None:
+            self.request_results[key] = (request_hash, None)
+            return ConversationRequestClaim(created=True, result=None)
+        current_hash, result = current
+        if current_hash != request_hash:
+            raise IdempotencyKeyConflict("The request key was reused with different content.")
+        return ConversationRequestClaim(created=False, result=result)
+
+    def complete_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        result: dict[str, Any],
+    ) -> None:
+        current_hash, _ = self.request_results[(conversation_id, request_id)]
+        self.request_results[(conversation_id, request_id)] = (current_hash, result)
 
     def get_for_owner(
         self,
@@ -103,6 +137,7 @@ class _FakeWorkflow:
         self.read_configs: list[dict[str, Any]] = []
         self.active_calls = 0
         self.max_active_calls = 0
+        self.started = asyncio.Event()
 
     async def aget_state(self, config: Mapping[str, Any]) -> _Snapshot:
         self.read_configs.append(dict(config))
@@ -115,6 +150,7 @@ class _FakeWorkflow:
     ) -> dict[str, Any]:
         self.active_calls += 1
         self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        self.started.set()
         self.inputs.append(input)
         self.configs.append(config)
         try:
@@ -122,6 +158,10 @@ class _FakeWorkflow:
                 await asyncio.sleep(self.delay_seconds)
 
             if isinstance(input, Command):
+                self.state.update(self.result)
+                self.next_nodes = ()
+                return dict(self.state)
+            if input is None:
                 self.state.update(self.result)
                 self.next_nodes = ()
                 return dict(self.state)
@@ -153,11 +193,16 @@ def test_create_conversation_binds_authenticated_owner() -> None:
     service = ConversationService(repository, _FakeWorkflow())
     request_id = UUID("99999999-9999-4999-8999-999999999999")
 
-    conversation = asyncio.run(service.create_conversation(_OWNER, request_id))
+    conversation = asyncio.run(
+        service.create_conversation(
+            _OWNER,
+            idempotency_key=str(request_id),
+            request_hash="safe-request-hash",
+        )
+    )
 
     assert conversation.owner_reference == _OWNER
-    assert conversation.creation_request_id == request_id
-    assert repository.created_owners == [(_OWNER, request_id)]
+    assert repository.created_owners == [(_OWNER, str(request_id), "safe-request-hash")]
 
 
 def test_create_conversation_rejects_empty_owner() -> None:
@@ -167,7 +212,8 @@ def test_create_conversation_rejects_empty_owner() -> None:
         asyncio.run(
             service.create_conversation(
                 "  ",
-                UUID("99999999-9999-4999-8999-999999999999"),
+                idempotency_key="key",
+                request_hash="hash",
             )
         )
 
@@ -240,6 +286,170 @@ def test_retry_with_same_request_id_does_not_invoke_workflow_twice() -> None:
 
     assert first == second == "We can help."
     assert len(workflow.inputs) == 1
+
+
+def test_retry_resumes_a_checkpointed_request_that_never_finished() -> None:
+    conversation = _conversation()
+    request_id = UUID("dededede-dede-4ded-8ded-dededededede")
+    workflow = _FakeWorkflow(
+        {"response": "Recovered response."},
+        state={
+            "conversation_id": str(conversation.id),
+            "request_id": str(request_id),
+            "messages": [HumanMessage(content="Recover this", id=str(request_id))],
+            "response": "",
+            "approval_status": "not_required",
+        },
+        next_nodes=("appointment_handler",),
+    )
+    repository = _FakeRepository([conversation])
+    service = ConversationService(repository, workflow)
+
+    response = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "Recover this",
+            owner_reference=_OWNER,
+            request_id=request_id,
+        )
+    )
+
+    assert response == "Recovered response."
+    assert workflow.inputs == [None]
+    assert repository.request_results[(conversation.id, request_id)][1] == {
+        "conversation_id": str(conversation.id),
+        "request_id": str(request_id),
+        "approval_status": "not_required",
+        "response": "Recovered response.",
+    }
+
+
+def test_idempotency_result_survives_bounded_history_trimming() -> None:
+    conversation = _conversation()
+    repository = _FakeRepository([conversation])
+    workflow = _FakeWorkflow({"response": "Original response."})
+    service = ConversationService(repository, workflow)
+    original_request_id = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    original = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "I need an appointment.",
+            owner_reference=_OWNER,
+            request_id=original_request_id,
+        )
+    )
+
+    for index in range(MAX_MESSAGES + 2):
+        asyncio.run(
+            service.process_message(
+                conversation.id,
+                f"Follow-up {index}",
+                owner_reference=_OWNER,
+                request_id=UUID(int=index + 1),
+            )
+        )
+    invocation_count = len(workflow.inputs)
+
+    replay = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "I need an appointment.",
+            owner_reference=_OWNER,
+            request_id=original_request_id,
+        )
+    )
+
+    assert replay == original == "Original response."
+    assert len(workflow.inputs) == invocation_count
+
+
+def test_request_id_cannot_be_reused_for_different_message_content() -> None:
+    conversation = _conversation()
+    workflow = _FakeWorkflow()
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+    request_id = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    asyncio.run(
+        service.process_message(
+            conversation.id,
+            "First message",
+            owner_reference=_OWNER,
+            request_id=request_id,
+        )
+    )
+
+    with pytest.raises(IdempotencyKeyConflict):
+        asyncio.run(
+            service.process_message(
+                conversation.id,
+                "Changed message",
+                owner_reference=_OWNER,
+                request_id=request_id,
+            )
+        )
+
+
+def test_durable_request_result_survives_message_history_trimming() -> None:
+    conversation = _conversation()
+    repository = _FakeRepository([conversation])
+    workflow = _FakeWorkflow({"response": "The original request was completed."})
+    service = ConversationService(repository, workflow)
+    original_request_id = UUID("babababa-baba-4aba-8aba-babababababa")
+
+    original_response = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "I need to book an appointment.",
+            owner_reference=_OWNER,
+            request_id=original_request_id,
+        )
+    )
+    for index in range(MAX_MESSAGES + 2):
+        asyncio.run(
+            service.process_message(
+                conversation.id,
+                f"follow-up {index}",
+                owner_reference=_OWNER,
+                request_id=UUID(int=index + 1),
+            )
+        )
+    invocation_count = len(workflow.inputs)
+
+    replay = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "I need to book an appointment.",
+            owner_reference=_OWNER,
+            request_id=original_request_id,
+        )
+    )
+
+    assert replay == original_response == "The original request was completed."
+    assert len(workflow.inputs) == invocation_count
+
+
+def test_reusing_message_request_id_with_changed_content_is_rejected() -> None:
+    conversation = _conversation()
+    workflow = _FakeWorkflow()
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+    request_id = UUID("bcbcbcbc-bcbc-4bcb-8bcb-bcbcbcbcbcbc")
+
+    asyncio.run(
+        service.process_message(
+            conversation.id,
+            "First request text",
+            owner_reference=_OWNER,
+            request_id=request_id,
+        )
+    )
+    with pytest.raises(IdempotencyKeyConflict):
+        asyncio.run(
+            service.process_message(
+                conversation.id,
+                "Different request text",
+                owner_reference=_OWNER,
+                request_id=request_id,
+            )
+        )
 
 
 async def _process_two_messages(
@@ -412,6 +622,95 @@ def test_staff_decision_cannot_resume_a_different_approval() -> None:
         )
 
     assert workflow.inputs == []
+
+
+async def _resume_and_send_message(
+    service: ConversationService,
+    workflow: _FakeWorkflow,
+    conversation_id: UUID,
+    approval_id: UUID,
+) -> None:
+    resume_task = asyncio.create_task(
+        service.resume_approval(conversation_id, approval_id, "approved")
+    )
+    await workflow.started.wait()
+    message_task = asyncio.create_task(
+        service.process_message(
+            conversation_id,
+            "What are the clinic hours?",
+            owner_reference=_OWNER,
+            request_id=UUID("abababab-abab-4bab-8bab-abababababab"),
+        )
+    )
+    await asyncio.gather(resume_task, message_task)
+
+
+def test_patient_message_and_staff_resume_share_one_thread_lock() -> None:
+    conversation = _conversation()
+    approval_id = UUID("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd")
+    workflow = _FakeWorkflow(
+        {
+            "approval_id": str(approval_id),
+            "approval_status": "approved",
+            "response": "Clinic staff approved your request.",
+        },
+        delay_seconds=0.01,
+        state={
+            "approval_id": str(approval_id),
+            "approval_status": "pending",
+        },
+        next_nodes=("approval_handler",),
+    )
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+
+    asyncio.run(_resume_and_send_message(service, workflow, conversation.id, approval_id))
+
+    assert workflow.max_active_calls == 1
+
+
+def test_approval_resume_updates_the_durable_message_replay_result() -> None:
+    approval_id = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    request_id = UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+    conversation = _conversation()
+    repository = _FakeRepository([conversation])
+    workflow = _FakeWorkflow(
+        {
+            "approval_id": str(approval_id),
+            "approval_status": "pending",
+            "response": "Waiting for staff review.",
+        },
+        next_nodes=("approval_handler",),
+    )
+    service = ConversationService(repository, workflow)
+    pending = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "Please book the offered slot.",
+            owner_reference=_OWNER,
+            request_id=request_id,
+        )
+    )
+    assert pending == "Waiting for staff review."
+
+    workflow.result = {
+        "approval_id": str(approval_id),
+        "approval_status": "approved",
+        "booking_status": "confirmed",
+        "response": "Clinic staff approved your request.",
+    }
+    final = asyncio.run(service.resume_approval(conversation.id, approval_id, "approved"))
+    replay = asyncio.run(
+        service.process_message(
+            conversation.id,
+            "Please book the offered slot.",
+            owner_reference=_OWNER,
+            request_id=request_id,
+        )
+    )
+
+    assert final["booking_status"] == "confirmed"
+    assert replay == "Clinic staff approved your request."
+    assert len(workflow.inputs) == 2
 
 
 def test_process_message_rejects_empty_and_oversized_messages() -> None:

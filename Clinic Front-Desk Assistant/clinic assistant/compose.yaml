@@ -19,6 +19,19 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: "${APP_ENV:-development}"
+      DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL in .env; use db as the hostname}"
+    command: ["python", "-m", "app.db.initialize"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   api:
     build:
       context: .
@@ -36,13 +49,10 @@ services:
       LLM_BASE_URL: "${LLM_BASE_URL:-}"
       LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-30}"
       CLINIC_DOCUMENTS_PATH: /app/data/clinic_documents
-    command:
-      - sh
-      - -c
-      - python -m app.db.initialize && exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     depends_on:
-      db:
-        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:${PORT:-8000}:8000"
     volumes:
