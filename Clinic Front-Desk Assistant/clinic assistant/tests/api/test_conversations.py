@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.conversations import router
+from app.repositories.conversations import IdempotencyKeyConflict
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import Conversation
 
@@ -39,17 +40,35 @@ class _FakeService:
         response: str = "We can help with that.",
         get_error: Exception | None = None,
         process_error: Exception | None = None,
+        create_error: Exception | None = None,
     ) -> None:
         self._conversation = conversation or _conversation()
         self._response = response
         self._get_error = get_error
         self._process_error = process_error
+        self._create_error = create_error
         self.processed: list[tuple[UUID, str]] = []
         self.owners: list[str] = []
         self.request_ids: list[UUID] = []
+        self.created: list[tuple[str, str, str]] = []
+        self._created_hashes: dict[tuple[str, str], str] = {}
 
-    async def create_conversation(self, owner_reference: str) -> Conversation:
-        self.owners.append(owner_reference)
+    async def create_conversation(
+        self,
+        owner_reference: str,
+        *,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation:
+        self.created.append((owner_reference, idempotency_key, request_hash))
+        if self._create_error is not None:
+            raise self._create_error
+
+        key = (owner_reference, idempotency_key)
+        existing_hash = self._created_hashes.get(key)
+        if existing_hash is not None and existing_hash != request_hash:
+            raise IdempotencyKeyConflict()
+        self._created_hashes[key] = request_hash
         return self._conversation
 
     async def get_conversation(
@@ -100,7 +119,48 @@ def test_create_conversation_returns_metadata() -> None:
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-01T00:00:00Z",
     }
-    assert service.owners == ["owner-1"]
+    assert len(service.created) == 1
+    assert service.created[0][0] == "owner-1"
+    assert service.created[0][1] == str(_REQUEST_ID)
+    assert service.created[0][2]
+
+
+def test_create_conversation_rejects_reused_key_with_different_content() -> None:
+    service = _FakeService(create_error=IdempotencyKeyConflict())
+    client = _client(service)
+
+    response = client.post("/conversations", headers=_HEADERS)
+
+    assert response.status_code == 409
+    assert "different request content" in response.json()["detail"]
+
+
+def test_create_conversation_retry_returns_original_conversation() -> None:
+    service = _FakeService()
+    client = _client(service)
+
+    first = client.post("/conversations", headers=_HEADERS)
+    second = client.post("/conversations", headers=_HEADERS)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json() == second.json()
+    assert len(service.created) == 2
+
+
+def test_create_conversation_key_reuse_with_changed_body_is_conflict() -> None:
+    service = _FakeService()
+    client = _client(service)
+
+    first = client.post("/conversations", headers=_HEADERS)
+    second = client.post(
+        "/conversations",
+        headers=_HEADERS,
+        json={"changed": True},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
 
 
 def test_get_conversation_returns_metadata() -> None:
