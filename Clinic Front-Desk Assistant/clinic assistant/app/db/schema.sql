@@ -82,6 +82,25 @@ BEGIN
 END;
 $migration$;
 
+-- Durable idempotency for conversation creation, scoped to the authenticated owner.
+CREATE TABLE IF NOT EXISTS conversation_idempotency (
+    owner_reference TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    conversation_id UUID NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (owner_reference, idempotency_key),
+    CONSTRAINT conversation_idempotency_owner_not_blank
+        CHECK (BTRIM(owner_reference) <> ''),
+    CONSTRAINT conversation_idempotency_key_not_blank
+        CHECK (BTRIM(idempotency_key) <> ''),
+    CONSTRAINT conversation_idempotency_hash_not_blank
+        CHECK (BTRIM(request_hash) <> '')
+);
+
+CREATE INDEX IF NOT EXISTS conversation_idempotency_conversation_idx
+    ON conversation_idempotency (conversation_id);
+
 CREATE TABLE IF NOT EXISTS bookings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     slot_id UUID NOT NULL REFERENCES appointment_slots (id) ON DELETE RESTRICT,
