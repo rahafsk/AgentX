@@ -8,7 +8,12 @@ from uuid import UUID, uuid4
 from psycopg import Connection
 from psycopg.rows import dict_row
 
+from app.repositories.errors import RepositoryError
 from app.repositories.models import Conversation
+
+
+class IdempotencyKeyConflict(RepositoryError):
+    """The same key was reused with different request content."""
 
 
 def _conversation_from_row(
@@ -58,6 +63,92 @@ class ConversationRepository:
             raise RuntimeError("PostgreSQL did not return the inserted conversation.")
 
         return _conversation_from_row(row)
+
+    def create_idempotent(
+        self,
+        owner_reference: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation:
+        """Create a conversation and its idempotency record atomically.
+
+        The advisory lock serializes concurrent retries with the same owner and
+        key, while the primary key remains the final duplicate guard.
+        """
+        owner_reference = owner_reference.strip()
+        idempotency_key = idempotency_key.strip()
+        request_hash = request_hash.strip()
+
+        if not owner_reference:
+            raise ValueError("owner_reference cannot be empty.")
+        if not idempotency_key:
+            raise ValueError("idempotency_key cannot be empty.")
+        if not request_hash:
+            raise ValueError("request_hash cannot be empty.")
+
+        conversation_id = uuid4()
+        thread_id = str(conversation_id)
+
+        with self._connection.transaction():
+            with self._connection.cursor(row_factory=dict_row) as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"{owner_reference}:{idempotency_key}",),
+                )
+                cursor.execute(
+                    """
+                    SELECT idempotency.request_hash,
+                           conversation.id,
+                           conversation.thread_id,
+                           conversation.created_at,
+                           conversation.updated_at,
+                           conversation.owner_reference
+                    FROM conversation_idempotency AS idempotency
+                    JOIN conversations AS conversation
+                      ON conversation.id = idempotency.conversation_id
+                    WHERE idempotency.owner_reference = %s
+                      AND idempotency.idempotency_key = %s
+                    """,
+                    (owner_reference, idempotency_key),
+                )
+                existing = cursor.fetchone()
+
+                if existing is not None:
+                    if existing["request_hash"] != request_hash:
+                        raise IdempotencyKeyConflict(
+                            "The idempotency key was reused with different request content."
+                        )
+                    return _conversation_from_row(existing)
+
+                cursor.execute(
+                    """
+                    INSERT INTO conversations (id, thread_id, owner_reference)
+                    VALUES (%s, %s, %s)
+                    RETURNING id, thread_id, created_at, updated_at, owner_reference
+                    """,
+                    (conversation_id, thread_id, owner_reference),
+                )
+                row = cursor.fetchone()
+
+                if row is None:
+                    raise RuntimeError("PostgreSQL did not return the inserted conversation.")
+
+                cursor.execute(
+                    """
+                    INSERT INTO conversation_idempotency (
+                        owner_reference, idempotency_key, request_hash, conversation_id
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (
+                        owner_reference,
+                        idempotency_key,
+                        request_hash,
+                        conversation_id,
+                    ),
+                )
+
+                return _conversation_from_row(row)
 
     def get(self, conversation_id: UUID) -> Conversation | None:
         with self._connection.transaction():
