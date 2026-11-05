@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from langchain_core.messages import HumanMessage, RemoveMessage
 
 from app.graphs.states import MAX_MESSAGES
+from app.repositories.conversations import IdempotencyKeyConflict
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import Conversation
 from app.services.conversations import (
@@ -39,11 +41,35 @@ class _FakeRepository:
         self._conversations = {item.id: item for item in conversations or []}
         self.created_owners: list[str] = []
         self.touched: list[tuple[UUID, str]] = []
+        self.idempotency: dict[tuple[str, str], Conversation] = {}
+        self.request_hashes: dict[tuple[str, str], str] = {}
 
     def create(self, owner_reference: str) -> Conversation:
         self.created_owners.append(owner_reference)
-        conversation = _conversation(owner_reference)
+        conversation = replace(
+            _conversation(owner_reference),
+            id=uuid4(),
+            thread_id=str(uuid4()),
+        )
         self._conversations[conversation.id] = conversation
+        return conversation
+
+    def create_idempotent(
+        self,
+        owner_reference: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation:
+        key = (owner_reference, idempotency_key)
+        existing = self.idempotency.get(key)
+        if existing is not None:
+            if self.request_hashes[key] != request_hash:
+                raise IdempotencyKeyConflict("different request")
+            return existing
+
+        conversation = self.create(owner_reference)
+        self.idempotency[key] = conversation
+        self.request_hashes[key] = request_hash
         return conversation
 
     def get_for_owner(
@@ -83,8 +109,8 @@ class _FakeWorkflow:
         self.result = result if result is not None else {"response": "We can help."}
         self.delay_seconds = delay_seconds
         self.state = dict(state or {})
-        self.inputs: list[dict[str, Any]] = []
-        self.configs: list[dict[str, Any] | None] = []
+        self.inputs: list[Any] = []
+        self.configs: list[Mapping[str, Any] | None] = []
         self.read_configs: list[dict[str, Any]] = []
         self.active_calls = 0
         self.max_active_calls = 0
@@ -95,8 +121,8 @@ class _FakeWorkflow:
 
     async def ainvoke(
         self,
-        input: dict[str, Any],
-        config: dict[str, Any] | None = None,
+        input: Any,
+        config: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.active_calls += 1
         self.max_active_calls = max(self.max_active_calls, self.active_calls)
@@ -132,17 +158,97 @@ def test_create_conversation_binds_authenticated_owner() -> None:
     repository = _FakeRepository()
     service = ConversationService(repository, _FakeWorkflow())
 
-    conversation = asyncio.run(service.create_conversation(_OWNER))
+    conversation = asyncio.run(
+        service.create_conversation(
+            _OWNER,
+            idempotency_key="create-1",
+            request_hash="hash-1",
+        )
+    )
 
     assert conversation.owner_reference == _OWNER
     assert repository.created_owners == [_OWNER]
+
+
+def test_create_conversation_retry_returns_original_conversation() -> None:
+    repository = _FakeRepository()
+    service = ConversationService(repository, _FakeWorkflow())
+
+    first = asyncio.run(
+        service.create_conversation(
+            _OWNER,
+            idempotency_key="create-1",
+            request_hash="hash-1",
+        )
+    )
+    second = asyncio.run(
+        service.create_conversation(
+            _OWNER,
+            idempotency_key="create-1",
+            request_hash="hash-1",
+        )
+    )
+
+    assert second == first
+    assert repository.created_owners == [_OWNER]
+
+
+def test_create_conversation_rejects_key_reuse_with_different_content() -> None:
+    repository = _FakeRepository()
+    service = ConversationService(repository, _FakeWorkflow())
+
+    asyncio.run(
+        service.create_conversation(
+            _OWNER,
+            idempotency_key="create-1",
+            request_hash="hash-1",
+        )
+    )
+
+    with pytest.raises(IdempotencyKeyConflict):
+        asyncio.run(
+            service.create_conversation(
+                _OWNER,
+                idempotency_key="create-1",
+                request_hash="hash-2",
+            )
+        )
+
+
+def test_create_conversation_key_is_scoped_to_owner() -> None:
+    repository = _FakeRepository()
+    service = ConversationService(repository, _FakeWorkflow())
+
+    first = asyncio.run(
+        service.create_conversation(
+            "owner-1",
+            idempotency_key="shared-key",
+            request_hash="hash-1",
+        )
+    )
+    second = asyncio.run(
+        service.create_conversation(
+            "owner-2",
+            idempotency_key="shared-key",
+            request_hash="hash-1",
+        )
+    )
+
+    assert first.id != second.id
+    assert repository.created_owners == ["owner-1", "owner-2"]
 
 
 def test_create_conversation_rejects_empty_owner() -> None:
     service = ConversationService(_FakeRepository(), _FakeWorkflow())
 
     with pytest.raises(ValueError, match="owner_reference"):
-        asyncio.run(service.create_conversation("  "))
+        asyncio.run(
+            service.create_conversation(
+                "  ",
+                idempotency_key="create-1",
+                request_hash="hash-1",
+            )
+        )
 
 
 def test_get_conversation_checks_owner_without_leaking_existence() -> None:
