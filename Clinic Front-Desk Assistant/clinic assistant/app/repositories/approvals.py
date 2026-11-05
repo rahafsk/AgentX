@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
-from psycopg import Connection
+from psycopg import Connection, Cursor
 from psycopg.rows import dict_row
 
+from app.repositories._locks import lock_slot
 from app.repositories.errors import (
     ApprovalAlreadyDecided,
     ApprovalAlreadyPending,
@@ -35,6 +36,42 @@ def _approval_from_row(row: dict[str, Any]) -> Approval:
     )
 
 
+def _lock_booking(
+    cursor: Cursor[dict[str, Any]],
+    booking_id: UUID,
+) -> dict[str, Any]:
+    """Lock doctor, slot, then booking."""
+    cursor.execute(
+        "SELECT slot_id FROM bookings WHERE id = %s",
+        (booking_id,),
+    )
+    reference = cursor.fetchone()
+
+    if reference is None:
+        raise ApprovalContextMismatch("The booking does not exist.")
+
+    slot_id = reference["slot_id"]
+
+    # This locks the doctor first, then the slot.
+    lock_slot(cursor, slot_id)
+
+    cursor.execute(
+        """
+        SELECT id, slot_id, conversation_id, status
+        FROM bookings
+        WHERE id = %s
+        FOR UPDATE
+        """,
+        (booking_id,),
+    )
+    booking = cursor.fetchone()
+
+    if booking is None or booking["slot_id"] != slot_id:
+        raise ApprovalContextMismatch("The booking changed. Retry the request.")
+
+    return booking
+
+
 class ApprovalRepository:
     """Create, list, and decide durable staff approvals."""
 
@@ -46,25 +83,20 @@ class ApprovalRepository:
         booking_id: UUID,
         conversation_id: UUID,
         action: ApprovalAction,
+        *,
+        request_id: UUID | None = None,
     ) -> Approval:
-        """Create a pending approval tied to a booking in the expected state."""
+        """Create a pending approval using the shared locking order."""
         if action not in {"same_day_booking", "cancel_booking"}:
             raise ValueError("action must be 'same_day_booking' or 'cancel_booking'.")
 
+        approval_id = request_id if request_id is not None else uuid4()
+
         with self._connection.transaction():
             with self._connection.cursor(row_factory=dict_row) as cursor:
-                cursor.execute(
-                    """
-                    SELECT status
-                    FROM bookings
-                    WHERE id = %s AND conversation_id = %s
-                    FOR UPDATE
-                    """,
-                    (booking_id, conversation_id),
-                )
-                booking_row = cursor.fetchone()
+                booking_row = _lock_booking(cursor, booking_id)
 
-                if booking_row is None:
+                if booking_row["conversation_id"] != conversation_id:
                     raise ApprovalContextMismatch(
                         "The approval must reference the booking's conversation."
                     )
@@ -81,12 +113,19 @@ class ApprovalRepository:
                 try:
                     cursor.execute(
                         """
-                        INSERT INTO approvals (booking_id, conversation_id, action)
-                        VALUES (%s, %s, %s)
+                        INSERT INTO approvals (
+                            id, booking_id, conversation_id, action
+                        )
+                        VALUES (%s, %s, %s, %s)
                         RETURNING id, booking_id, conversation_id, action, status,
                                   requested_at, decided_at, decided_by, decision_note
                         """,
-                        (booking_id, conversation_id, action),
+                        (
+                            approval_id,
+                            booking_id,
+                            conversation_id,
+                            action,
+                        ),
                     )
                     row = cursor.fetchone()
 
@@ -100,10 +139,10 @@ class ApprovalRepository:
                         "An approval for this booking action is already pending."
                     ) from exc
 
-        if row is None:
-            raise RuntimeError("PostgreSQL did not return the inserted approval.")
+                if row is None:
+                    raise RuntimeError("PostgreSQL did not return the inserted approval.")
 
-        return _approval_from_row(row)
+                return _approval_from_row(row)
 
     def get(self, approval_id: UUID) -> Approval | None:
         with self._connection.transaction():
@@ -149,13 +188,18 @@ class ApprovalRepository:
         decided_by: str,
         decision_note: str | None = None,
     ) -> Approval:
-        """Lock the booking first, then decide its approval."""
+        """Lock doctor, slot, booking, then approval."""
         if decision not in {"approved", "rejected"}:
             raise ValueError("decision must be 'approved' or 'rejected'.")
 
         decided_by = decided_by.strip()
         if not decided_by:
             raise ValueError("decided_by cannot be empty.")
+
+        if not decision_note or not decision_note.strip():
+            raise ValueError("A decision reason is required.")
+
+        decision_note = decision_note.strip()
 
         with self._connection.transaction():
             with self._connection.cursor(row_factory=dict_row) as cursor:
@@ -175,19 +219,7 @@ class ApprovalRepository:
 
                 booking_id = approval_reference["booking_id"]
 
-                # Lock the booking first, matching create().
-                cursor.execute(
-                    """
-                    SELECT id
-                    FROM bookings
-                    WHERE id = %s
-                    FOR UPDATE
-                    """,
-                    (booking_id,),
-                )
-
-                if cursor.fetchone() is None:
-                    raise ApprovalStateConflict("The approval's booking does not exist.")
+                _lock_booking(cursor, booking_id)
 
                 # Lock and read the approval again after obtaining the booking lock.
                 cursor.execute(
