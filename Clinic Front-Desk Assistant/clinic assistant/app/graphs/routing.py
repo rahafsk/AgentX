@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 from langchain_core.messages import AnyMessage, HumanMessage
 
@@ -317,9 +317,16 @@ _CONTEXTUAL_FOLLOW_UP_TOKENS: Final[frozenset[str]] = frozenset(
         "maybe",
         "next",
         "on",
+        "option",
+        "options",
         "one",
         "please",
         "prefer",
+        "choice",
+        "choices",
+        "slot",
+        "booking",
+        "appointment",
         "sounds",
         "sure",
         "thanks",
@@ -623,7 +630,7 @@ def _message_text(message: AnyMessage) -> str:
     return ""
 
 
-def classify_intent_node(state: ConversationState) -> dict[str, Intent]:
+def classify_intent_node(state: ConversationState) -> dict[str, Any]:
     """Classify the latest patient message and store the intent in graph state.
 
     Missing or empty message history is handled as ``"other"`` rather than
@@ -641,6 +648,16 @@ def classify_intent_node(state: ConversationState) -> dict[str, Intent]:
         previous_intent = state.get("intent")
         if previous_intent is not None and previous_intent in _APPOINTMENT_INTENTS:
             return {"intent": previous_intent}
+
+    if intent not in _APPOINTMENT_INTENTS:
+        updates: dict[str, Any] = {"intent": intent}
+        if "selected_slot_id" in state:
+            updates["selected_slot_id"] = None
+        if "available_slots" in state:
+            updates["available_slots"] = []
+        if "available_bookings" in state:
+            updates["available_bookings"] = []
+        return updates
 
     return {"intent": intent}
 

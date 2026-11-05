@@ -1,4 +1,4 @@
-"""HTTP endpoints for listing and deciding staff approvals."""
+"""Authenticated staff endpoints for pending appointment approvals."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ from typing import Annotated, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.api.dependencies import StaffReferenceDependency
 from app.repositories.errors import (
     ApprovalAlreadyDecided,
     ApprovalContextMismatch,
@@ -16,12 +17,7 @@ from app.repositories.errors import (
     ApprovalStateConflict,
     ConversationNotFound,
 )
-from app.repositories.models import (
-    Approval,
-    ApprovalAction,
-    ApprovalDecision,
-    ApprovalStatus,
-)
+from app.repositories.models import Approval, ApprovalAction, ApprovalDecision, ApprovalStatus
 from app.services.approvals import (
     ApprovalDecisionConflict,
     ApprovalResumeTimeout,
@@ -43,9 +39,15 @@ class ApprovalResponse(BaseModel):
     decided_at: datetime | None
     decided_by: str | None
     decision_note: str | None
+    response: str | None = None
 
     @classmethod
-    def from_approval(cls, approval: Approval) -> ApprovalResponse:
+    def from_approval(
+        cls,
+        approval: Approval,
+        *,
+        response: str | None = None,
+    ) -> ApprovalResponse:
         return cls(
             id=approval.id,
             booking_id=approval.booking_id,
@@ -56,30 +58,32 @@ class ApprovalResponse(BaseModel):
             decided_at=approval.decided_at,
             decided_by=approval.decided_by,
             decision_note=approval.decision_note,
+            response=response,
         )
 
 
-class ApprovalDecisionRequest(BaseModel):
-    """A staff decision for a pending approval."""
-
-    decision: ApprovalDecision
-    decided_by: str = Field(min_length=1, max_length=200)
-    decision_note: str = Field(min_length=1, max_length=1000)
-
-    @field_validator("decided_by", "decision_note")
-    @classmethod
-    def reject_blank_values(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("must not be blank")
-        return value
-
-
 class ApprovalDecisionResponse(BaseModel):
-    """The decided approval and the resumed workflow response."""
+    """A persisted staff decision and the resumed patient-facing response."""
 
     approval: ApprovalResponse
     response: str
+
+
+class ApprovalDecisionRequest(BaseModel):
+    """A staff decision and required audit explanation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: ApprovalDecision
+    decision_note: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("decision_note")
+    @classmethod
+    def reject_blank_note(cls, value: str) -> str:
+        note = value.strip()
+        if not note:
+            raise ValueError("A decision reason is required.")
+        return note
 
 
 def get_approval_service(request: Request) -> ApprovalService:
@@ -100,13 +104,16 @@ ApprovalServiceDependency = Annotated[
 
 
 @router.get("", response_model=list[ApprovalResponse])
+@router.get("/pending", response_model=list[ApprovalResponse])
 async def list_pending_approvals(
     service: ApprovalServiceDependency,
+    staff_reference: StaffReferenceDependency,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> list[ApprovalResponse]:
-    """List pending staff approvals."""
-    pending = await service.list_pending(limit=limit)
-    return [ApprovalResponse.from_approval(approval) for approval in pending]
+    """List pending approvals for authenticated clinic staff."""
+    del staff_reference
+    approvals = await service.list_pending(limit=limit)
+    return [ApprovalResponse.from_approval(approval) for approval in approvals]
 
 
 @router.post("/{approval_id}/decision", response_model=ApprovalDecisionResponse)
@@ -114,43 +121,43 @@ async def decide_approval(
     approval_id: UUID,
     payload: ApprovalDecisionRequest,
     service: ApprovalServiceDependency,
+    staff_reference: StaffReferenceDependency,
 ) -> ApprovalDecisionResponse:
-    """Approve or reject a pending request and resume its workflow."""
+    """Persist the authenticated staff decision and resume its graph thread."""
     try:
         approval, response = await service.decide(
             approval_id,
             payload.decision,
-            decided_by=payload.decided_by,
+            decided_by=staff_reference,
             decision_note=payload.decision_note,
         )
     except ApprovalNotFound as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Approval not found.",
-        ) from exc
+        raise HTTPException(status_code=404, detail="Approval not found.") from exc
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from exc
     except (
         ApprovalAlreadyDecided,
         ApprovalDecisionConflict,
-        ApprovalStateConflict,
         ApprovalContextMismatch,
-        ConversationNotFound,
+        ApprovalStateConflict,
     ) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The approval can no longer be decided.",
-        ) from exc
+        raise HTTPException(status_code=409, detail="The approval cannot be decided.") from exc
     except ApprovalResumeTimeout as exc:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=(
-                "The decision was recorded, but the workflow resume did not complete. "
-                "Retry the same decision."
-            ),
+            detail="The decision was recorded; retry the same decision to resume the workflow.",
         ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="The decision was recorded; retry the same decision to resume the workflow.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="The approval decision could not be completed.",
+            status_code=503,
+            detail="The approval decision could not be completed; retry the same decision.",
         ) from exc
 
     return ApprovalDecisionResponse(

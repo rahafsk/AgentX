@@ -43,7 +43,7 @@ Emergency detection runs before ordinary intent routing. Emergencies receive an 
 
 | Component | Responsibility |
 | --- | --- |
-| `app/main.py` | Create the FastAPI application, register routers, and expose `/health`. |
+| `app/main.py` | Create the FastAPI application, register routers, and compose pooled PostgreSQL/checkpointer services. |
 | `app/api/` | Validate HTTP requests and responses for conversations, appointments, and staff approvals. |
 | `app/graphs/` | Define conversation state, detect and route intents, and connect workflow branches. |
 | `app/services/` | Implement conversation, appointment, approval, and clinic-knowledge behavior. |
@@ -57,11 +57,14 @@ Emergency detection runs before ordinary intent routing. Emergencies receive an 
 ## Shared contracts and persistence
 
 - **Conversation identity:** The API conversation ID must consistently identify the LangGraph thread. The graph uses that stable thread ID when saving and resuming checkpoints.
-- **Workflow state:** The team agrees on shared fields for recent bounded message history, intent, requested appointment slot, and approval status before connecting graph branches.
+- **Caller identity:** Conversation and appointment routes derive owner references from trusted host authentication context, never from request bodies. Staff approval routes require a separate trusted staff context. Hosts provide these resolvers when composing the application; requests fail closed when context is absent.
+- **Idempotency:** Conversation creation and message/appointment actions require UUID `Idempotency-Key` headers. Creation keys and message results are persisted independently of bounded graph history; booking and approval actions reuse their durable database records on retry.
+- **Workflow state:** Keep bounded message history and persist selectable slot/booking IDs in structured workflow state. A booking or cancellation must identify the patient's chosen slot/booking; never silently choose the first record.
 - **Database:** PostgreSQL is the only database. Use psycopg with parameterized SQL; do not add an ORM.
 - **Appointment safety:** Booking must be atomic and database-backed. A database constraint must reject competing requests for an already-reserved slot, including simultaneous requests.
 - **Checkpoints:** LangGraph's PostgreSQL checkpointer stores workflow state so a conversation or pending approval can be restored after a process/container restart. Initialize its tables using the checkpointer's supported setup/migrations rather than duplicating its internal schema.
-- **Approvals:** Same-day bookings and cancellations pause for staff decisions. The approval record and graph checkpoint must persist together sufficiently to resume the correct conversation after a restart.
+- **Initialization:** Apply application schema and LangGraph migrations once through the deployment/setup initializer. API lifespan setup verifies required tables and opens the connection pool; it does not replay table-locking DDL.
+- **Approvals:** Same-day bookings and cancellations pause for staff decisions. Booking/approval changes are atomic in PostgreSQL; checkpoint resume is a separate operation protected by durable request IDs and replay recovery, so retries can restore a missing pause or finish a saved decision.
 - **Seed data:** Fictional providers and slots are development fixtures only. The initializer must not load them outside `APP_ENV=development`.
 
 ## Safety and reliability
@@ -75,7 +78,7 @@ Emergency detection runs before ordinary intent routing. Emergencies receive an 
 ## Configuration, deployment, and testing
 
 - Configure the service through validated environment variables documented in `.env.example`.
-- The intended fresh-clone workflow starts the backend and PostgreSQL with Docker Compose; database schema and checkpoint initialization run before workflows need them.
+- The intended fresh-clone workflow starts the backend and PostgreSQL with Docker Compose; a one-shot migration service initializes the schema/checkpointer before the API starts.
 - Test services and repositories independently, then cover API and cross-module workflows with unit, API, database, and integration tests.
 - CI should run Ruff lint/format checks, mypy, and pytest, with the project coverage target of at least 80%.
 - Record research findings in `docs/research/` and lasting design decisions in `docs/adr/`.

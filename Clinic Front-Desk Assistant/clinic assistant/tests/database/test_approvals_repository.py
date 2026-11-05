@@ -172,6 +172,31 @@ def test_duplicate_pending_request(
         repository.create(booking_id, conversation_id, "same_day_booking")
 
 
+def test_approval_request_id_replays_the_original_approval(
+    database_connection: Connection[Any],
+    booking_data: tuple[UUID, UUID],
+) -> None:
+    repository = ApprovalRepository(database_connection)
+    booking_id, conversation_id = booking_data
+    request_id = uuid4()
+
+    approval = repository.create(
+        booking_id,
+        conversation_id,
+        "same_day_booking",
+        request_id=request_id,
+    )
+    replay = repository.create(
+        booking_id,
+        conversation_id,
+        "same_day_booking",
+        request_id=request_id,
+    )
+
+    assert approval.id == request_id
+    assert replay == approval
+
+
 def test_duplicate_decision(
     database_connection: Connection[Any],
     booking_data: tuple[UUID, UUID],
@@ -199,6 +224,30 @@ def test_duplicate_decision(
             decided_by="test-staff",
             decision_note="Repeated decision.",
         )
+
+
+def test_retrying_the_same_decision_is_idempotent(
+    database_connection: Connection[Any],
+    booking_data: tuple[UUID, UUID],
+) -> None:
+    repository = ApprovalRepository(database_connection)
+    booking_id, conversation_id = booking_data
+    approval = repository.create(booking_id, conversation_id, "same_day_booking")
+
+    first = repository.decide(
+        approval.id,
+        "approved",
+        decided_by="test-staff",
+        decision_note="First decision.",
+    )
+    retry = repository.decide(
+        approval.id,
+        "approved",
+        decided_by="test-staff",
+        decision_note="Retried after a network timeout.",
+    )
+
+    assert retry == first
 
 
 def test_unknown_approval(

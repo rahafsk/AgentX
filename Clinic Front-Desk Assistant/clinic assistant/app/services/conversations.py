@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 from uuid import UUID
 
 from langchain_core.messages import AnyMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 
 from app.graphs.states import MAX_MESSAGES, ConversationState, trim_messages_node
-from app.repositories.errors import ConversationNotFound
-from app.repositories.models import Conversation
+from app.repositories.conversations import ConversationRequestClaim
+from app.repositories.errors import (
+    ApprovalNotFound,
+    ApprovalStateConflict,
+    ConversationNotFound,
+)
+from app.repositories.models import ApprovalDecision, Conversation
 
 DEFAULT_WORKFLOW_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_MESSAGE_CHARACTERS = 4000
@@ -31,7 +40,7 @@ _Result = TypeVar("_Result")
 class ConversationStore(Protocol):
     """Short, synchronous persistence calls; each call closes its transaction."""
 
-    def create(self, owner_reference: str) -> Conversation: ...
+    def create(self, owner_reference: str, request_id: UUID) -> Conversation: ...
 
     def create_idempotent(
         self,
@@ -40,11 +49,27 @@ class ConversationStore(Protocol):
         request_hash: str,
     ) -> Conversation: ...
 
+    def claim_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        request_hash: str,
+    ) -> ConversationRequestClaim: ...
+
+    def complete_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        result: dict[str, Any],
+    ) -> None: ...
+
     def get_for_owner(
         self,
         conversation_id: UUID,
         owner_reference: str,
     ) -> Conversation | None: ...
+
+    def get(self, conversation_id: UUID) -> Conversation | None: ...
 
     def touch_for_owner(
         self,
@@ -53,22 +78,16 @@ class ConversationStore(Protocol):
     ) -> Conversation | None: ...
 
 
-class ConversationSnapshot(Protocol):
-    """Read-only LangGraph checkpoint values for a conversation thread."""
-
-    values: Mapping[str, Any]
-
-
 class ConversationWorkflow(Protocol):
     """Compiled LangGraph workflow with checkpoint inspection and invocation."""
 
-    async def aget_state(self, config: Mapping[str, Any]) -> ConversationSnapshot: ...
+    async def aget_state(self, config: RunnableConfig) -> Any: ...
 
     async def ainvoke(
         self,
-        input: ConversationState,
-        config: Mapping[str, Any] | None = None,
-    ) -> Mapping[str, Any]: ...
+        input: ConversationState | Command[Any] | None,
+        config: RunnableConfig | None = None,
+    ) -> Any: ...
 
 
 class ConversationProcessingError(RuntimeError):
@@ -145,15 +164,6 @@ class ConversationService:
                 if entry.users == 0:
                     self._conversation_locks.pop(conversation_id, None)
 
-    @asynccontextmanager
-    async def serialize_conversation(
-        self,
-        conversation_id: UUID,
-    ) -> AsyncIterator[None]:
-        """Serialize patient messages and staff decisions for one thread."""
-        async with self._serialize_conversation(conversation_id):
-            yield
-
     @staticmethod
     def _validate_owner_reference(owner_reference: str) -> str:
         if not isinstance(owner_reference, str) or not owner_reference.strip():
@@ -167,7 +177,7 @@ class ConversationService:
         idempotency_key: str,
         request_hash: str,
     ) -> Conversation:
-        """Create or replay an idempotent conversation for the authenticated owner."""
+        """Create or replay a conversation using its durable owner-scoped key."""
         owner = self._validate_owner_reference(owner_reference)
         return await self._repository_call(
             self._repository.create_idempotent,
@@ -193,6 +203,99 @@ class ConversationService:
             # Do not reveal whether a conversation owned by someone else exists.
             raise ConversationNotFound("Conversation was not found.")
         return conversation
+
+    async def process_appointment_action(
+        self,
+        conversation_id: UUID,
+        *,
+        owner_reference: str,
+        request_id: UUID,
+        action: Literal["book", "cancel"],
+        slot_id: UUID | None = None,
+        booking_id: UUID | None = None,
+    ) -> Mapping[str, Any]:
+        """Route a structured booking/cancellation request through LangGraph."""
+        if action == "book":
+            if slot_id is None or booking_id is not None:
+                raise ValueError("A booking action requires only slot_id.")
+            message = "Please book the selected appointment slot."
+            workflow_updates: dict[str, Any] = {
+                "intent": "book_appointment",
+                "requested_slot": str(slot_id),
+            }
+        else:
+            if booking_id is None or slot_id is not None:
+                raise ValueError("A cancellation action requires only booking_id.")
+            message = "Please request cancellation of the selected booking."
+            workflow_updates = {
+                "intent": "cancel_appointment",
+                "requested_booking_id": str(booking_id),
+            }
+
+        result = await self.process_message(
+            conversation_id,
+            message,
+            owner_reference=owner_reference,
+            request_id=request_id,
+            workflow_updates=workflow_updates,
+            return_state=True,
+        )
+        if not isinstance(result, Mapping):
+            raise ConversationProcessingError("The workflow returned invalid state.")
+        return result
+
+    async def resume_approval(
+        self,
+        conversation_id: UUID,
+        approval_id: UUID,
+        decision: ApprovalDecision,
+    ) -> Mapping[str, Any]:
+        """Resume the durable graph turn after its approval record is decided."""
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("decision must be 'approved' or 'rejected'.")
+
+        async with self._serialize_conversation(conversation_id):
+            conversation = await self._repository_call(self._repository.get, conversation_id)
+            if conversation is None:
+                raise ConversationNotFound("Conversation was not found.")
+
+            config: RunnableConfig = {"configurable": {"thread_id": conversation.thread_id}}
+            snapshot = await self._workflow.aget_state(config)
+            values = snapshot.values
+            if values.get("approval_id") != str(approval_id):
+                raise ApprovalNotFound("The approval is not waiting in this conversation.")
+            if values.get("approval_status") == decision:
+                await self._persist_request_result(conversation_id, values)
+                return cast(Mapping[str, Any], values)
+            if (
+                values.get("approval_status") != "pending"
+                or "approval_handler" not in snapshot.next
+            ):
+                raise ApprovalStateConflict("The conversation is not paused for this approval.")
+
+            try:
+                result = await asyncio.wait_for(
+                    self._workflow.ainvoke(
+                        Command(resume={"decision": decision}),
+                        config,
+                    ),
+                    timeout=self._workflow_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                latest = await self._workflow.aget_state(config)
+                latest_values = latest.values
+                if (
+                    latest_values.get("approval_id") == str(approval_id)
+                    and latest_values.get("approval_status") == decision
+                ):
+                    await self._persist_request_result(conversation_id, latest_values)
+                    return cast(Mapping[str, Any], latest_values)
+                raise ConversationProcessingError(
+                    "The approval was saved, but the conversation could not be resumed."
+                ) from exc
+
+            await self._persist_request_result(conversation_id, result)
+            return cast(Mapping[str, Any], result)
 
     @staticmethod
     def _has_request(messages: Sequence[Any], request_id: UUID) -> bool:
@@ -223,7 +326,9 @@ class ConversationService:
         *,
         owner_reference: str,
         request_id: UUID,
-    ) -> str:
+        workflow_updates: Mapping[str, Any] | None = None,
+        return_state: bool = False,
+    ) -> str | Mapping[str, Any]:
         """Process one authorized, idempotent turn with bounded message history.
 
         The API must derive ``owner_reference`` from authentication and reuse
@@ -239,22 +344,89 @@ class ConversationService:
             )
         owner = self._validate_owner_reference(owner_reference)
 
+        if workflow_updates:
+            allowed_updates = {"intent", "requested_slot", "requested_booking_id"}
+            if set(workflow_updates) - allowed_updates:
+                raise ValueError("Unsupported structured workflow state update.")
+
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "message": message,
+                    "workflow_updates": dict(workflow_updates or {}),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
         async with self._serialize_conversation(conversation_id):
             conversation = await self.get_conversation(
                 conversation_id,
                 owner_reference=owner,
             )
-            config = {"configurable": {"thread_id": conversation.thread_id}}
+            config: RunnableConfig = {"configurable": {"thread_id": conversation.thread_id}}
             snapshot = await self._workflow.aget_state(config)
             values = snapshot.values
             history = values.get("messages", ())
             if not isinstance(history, Sequence) or isinstance(history, (str, bytes)):
                 history = ()
 
+            if values.get("approval_status") == "pending" and "approval_handler" in snapshot.next:
+                if not self._has_request(history, request_id):
+                    raise ConversationProcessingError(
+                        "This conversation is waiting for a staff approval."
+                    )
+
+            claim = await self._repository_call(
+                self._repository.claim_request,
+                conversation.id,
+                request_id,
+                request_hash,
+            )
+            if claim.result is not None:
+                if return_state:
+                    return claim.result
+                return self._response_from_state(claim.result)
+
             # LangGraph's add_messages reducer uses message IDs to reconcile turns.
             # Inspect the checkpoint first so retries do not invoke tools twice.
             if self._has_request(history, request_id):
-                return self._response_for_replay(values, request_id)
+                if values.get("request_id") != str(request_id):
+                    if return_state:
+                        raise ConversationProcessingError(
+                            "This appointment request was already processed."
+                        )
+                    replay = {"response": _ALREADY_PROCESSED_RESPONSE}
+                    await self._repository_call(
+                        self._repository.complete_request,
+                        conversation.id,
+                        request_id,
+                        replay,
+                    )
+                    return _ALREADY_PROCESSED_RESPONSE
+
+                if _workflow_result_is_complete(values, snapshot.next):
+                    return await self._complete_idempotent_request(
+                        conversation.id,
+                        request_id,
+                        values,
+                        return_state=return_state,
+                    )
+                if snapshot.next:
+                    resumed = await self._workflow.ainvoke(None, config)
+                    return await self._complete_idempotent_request(
+                        conversation.id,
+                        request_id,
+                        resumed,
+                        return_state=return_state,
+                    )
+                return await self._complete_idempotent_request(
+                    conversation.id,
+                    request_id,
+                    values,
+                    return_state=return_state,
+                )
 
             user_message = HumanMessage(content=message, id=str(request_id))
             combined_history = [*history, user_message]
@@ -275,12 +447,21 @@ class ConversationService:
 
             state: ConversationState = {
                 "conversation_id": str(conversation.id),
+                "patient_id": owner,
                 "request_id": str(request_id),
                 "messages": cast(list[AnyMessage], [*removals, user_message]),
                 # Clear previous turn values before this checkpoint is resumed.
                 "response": "",
                 "approval_status": "not_required",
+                "requested_slot": None,
+                "requested_booking_id": None,
+                "booking_id": None,
+                "booking_status": None,
+                "approval_id": None,
+                "workflow_error": None,
             }
+            if workflow_updates:
+                state.update(workflow_updates)  # type: ignore[typeddict-item]
 
             # Touch before invocation: if this DB operation fails, no graph side
             # effect has started and a completed checkpoint cannot be misreported.
@@ -307,10 +488,113 @@ class ConversationService:
                     latest_messages,
                     request_id,
                 ):
-                    return self._response_for_replay(latest_values, request_id)
+                    if return_state:
+                        return await self._complete_idempotent_request(
+                            conversation.id,
+                            request_id,
+                            latest_values,
+                            return_state=True,
+                        )
+                    return await self._complete_idempotent_request(
+                        conversation.id,
+                        request_id,
+                        latest_values,
+                        return_state=False,
+                    )
                 raise ConversationProcessingError(
                     "The workflow timed out. Retry with the same request_id."
                 ) from exc
 
             # An approval interrupt is a normal workflow outcome, not a missing reply.
-            return self._response_from_state(result)
+            return await self._complete_idempotent_request(
+                conversation.id,
+                request_id,
+                result,
+                return_state=return_state,
+            )
+
+    async def _complete_idempotent_request(
+        self,
+        conversation_id: UUID,
+        request_id: UUID,
+        state: Mapping[str, Any],
+        *,
+        return_state: bool,
+    ) -> str | Mapping[str, Any]:
+        """Persist only the result fields needed for safe replay."""
+        fields = (
+            "conversation_id",
+            "request_id",
+            "intent",
+            "requested_slot",
+            "selected_slot_id",
+            "requested_booking_id",
+            "booking_id",
+            "booking_status",
+            "approval_id",
+            "approval_status",
+            "workflow_error",
+            "available_slots",
+            "available_bookings",
+            "response",
+        )
+        result = {field: state[field] for field in fields if field in state}
+        await self._repository_call(
+            self._repository.complete_request,
+            conversation_id,
+            request_id,
+            result,
+        )
+        if return_state:
+            return result
+        return self._response_from_state(result)
+
+    async def _persist_request_result(
+        self,
+        conversation_id: UUID,
+        state: Mapping[str, Any],
+    ) -> None:
+        """Refresh the durable replay value when an interrupted turn completes."""
+        raw_request_id = state.get("request_id")
+        if not isinstance(raw_request_id, str):
+            return
+        try:
+            request_id = UUID(raw_request_id)
+        except ValueError:
+            return
+        fields = (
+            "conversation_id",
+            "request_id",
+            "intent",
+            "requested_slot",
+            "requested_booking_id",
+            "selected_slot_id",
+            "booking_id",
+            "booking_status",
+            "approval_id",
+            "approval_status",
+            "workflow_error",
+            "available_slots",
+            "available_bookings",
+            "response",
+        )
+        result = {field: state[field] for field in fields if field in state}
+        await self._repository_call(
+            self._repository.complete_request,
+            conversation_id,
+            request_id,
+            result,
+        )
+
+
+def _workflow_result_is_complete(
+    values: Mapping[str, Any],
+    next_nodes: Sequence[str],
+) -> bool:
+    """Recognize finished or durably paused turns during idempotent recovery."""
+    if values.get("approval_status") == "pending" and "approval_handler" in next_nodes:
+        return True
+    if values.get("workflow_error"):
+        return True
+    response = values.get("response")
+    return isinstance(response, str) and bool(response.strip()) and not next_nodes

@@ -367,6 +367,8 @@ def test_multiple_appointment_keywords_keep_priority(text: str, expected: Intent
         ("cancel_appointment", "Friday", "cancel_appointment"),
         ("book_appointment", "Let's do Friday afternoon, please", "book_appointment"),
         ("book_appointment", "the first one", "book_appointment"),
+        ("cancel_appointment", "option 2", "cancel_appointment"),
+        ("find_slots", "choice 1", "find_slots"),
     ],
 )
 def test_classify_intent_node_preserves_active_appointment_intent(

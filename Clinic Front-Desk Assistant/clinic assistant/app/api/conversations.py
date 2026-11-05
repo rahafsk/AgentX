@@ -7,18 +7,20 @@ from datetime import datetime
 from typing import Annotated, Protocol, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.api.dependencies import IdempotencyKey, OwnerReferenceDependency
 from app.repositories.conversations import IdempotencyKeyConflict
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import Conversation
+from app.services.conversations import ConversationProcessingError
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 
 def _create_request_hash(request: Request, body: bytes) -> str:
-    """Hash the request content so key reuse cannot change the operation."""
+    """Hash request content without persisting patient-provided text."""
     digest = hashlib.sha256()
     digest.update(request.method.encode("utf-8"))
     digest.update(b"\n")
@@ -77,6 +79,8 @@ class ConversationResponse(BaseModel):
 class MessageRequest(BaseModel):
     """A patient message sent to an existing conversation."""
 
+    model_config = ConfigDict(extra="forbid")
+
     message: str = Field(min_length=1, max_length=4000)
 
     @field_validator("message")
@@ -110,13 +114,6 @@ ConversationServiceDependency = Annotated[
     Depends(get_conversation_service),
 ]
 
-OwnerReference = Annotated[
-    str,
-    Header(alias="X-Owner-Reference", min_length=1, max_length=200),
-]
-
-IdempotencyKey = Annotated[UUID, Header(alias="Idempotency-Key")]
-
 
 @router.post(
     "",
@@ -126,10 +123,10 @@ IdempotencyKey = Annotated[UUID, Header(alias="Idempotency-Key")]
 async def create_conversation(
     request: Request,
     service: ConversationServiceDependency,
-    owner_reference: OwnerReference,
+    owner_reference: OwnerReferenceDependency,
     idempotency_key: IdempotencyKey,
 ) -> ConversationResponse:
-    """Create or replay a conversation for the authenticated owner."""
+    """Create or replay a conversation using its durable owner-scoped key."""
     body = await request.body()
     try:
         conversation = await service.create_conversation(
@@ -149,7 +146,7 @@ async def create_conversation(
 async def get_conversation(
     conversation_id: UUID,
     service: ConversationServiceDependency,
-    owner_reference: OwnerReference,
+    owner_reference: OwnerReferenceDependency,
 ) -> ConversationResponse:
     """Return metadata for one conversation."""
     try:
@@ -170,7 +167,7 @@ async def send_message(
     conversation_id: UUID,
     payload: MessageRequest,
     service: ConversationServiceDependency,
-    owner_reference: OwnerReference,
+    owner_reference: OwnerReferenceDependency,
     request_id: IdempotencyKey,
 ) -> MessageResponse:
     """Send one patient message through the conversation workflow."""
@@ -186,9 +183,24 @@ async def send_message(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found.",
         ) from exc
+    except IdempotencyKeyConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency-Key was reused with different request content.",
+        ) from exc
+    except ConversationProcessingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The message could not be resumed; retry with the same Idempotency-Key.",
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="The assistant could not process the message.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
         ) from exc
     return MessageResponse(response=response)

@@ -55,6 +55,33 @@ def test_same_key_is_isolated_by_owner(
     assert first.id != second.id
 
 
+def test_message_idempotency_result_survives_history_trimming(
+    database_connection: Connection[Any],
+) -> None:
+    repository = ConversationRepository(database_connection)
+    conversation = repository.create(f"owner-{uuid4()}", uuid4())
+    request_id = uuid4()
+
+    first_claim = repository.claim_request(conversation.id, request_id, "request-hash")
+    assert first_claim.created is True
+    assert first_claim.result is None
+
+    result = {
+        "conversation_id": str(conversation.id),
+        "request_id": str(request_id),
+        "response": "Appointment request is waiting for staff.",
+        "approval_status": "pending",
+    }
+    repository.complete_request(conversation.id, request_id, result)
+
+    replay = repository.claim_request(conversation.id, request_id, "request-hash")
+    assert replay.created is False
+    assert replay.result == result
+
+    with pytest.raises(IdempotencyKeyConflict):
+        repository.claim_request(conversation.id, request_id, "different-hash")
+
+
 def test_concurrent_retries_create_one_conversation(database_url: str) -> None:
     owner = f"owner-{uuid4()}"
     key = f"key-{uuid4()}"
