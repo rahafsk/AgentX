@@ -115,6 +115,9 @@ def test_common_emergency_phrasings_are_detected(text: str) -> None:
         ("I am not bleeding heavily.", "other"),
         ("I stopped breathing last week.", "other"),
         ("I don't want to die.", "other"),
+        ("I had chest pain yesterday and feel fine now.", "other"),
+        ("I have no fever or chest pain.", "other"),
+        ("I have no fever or trouble breathing.", "other"),
     ],
 )
 def test_negated_and_historical_emergencies_are_not_current(text: str, expected: Intent) -> None:
@@ -154,6 +157,34 @@ def test_negated_and_historical_emergencies_are_not_current(text: str, expected:
         ),
         (
             "I don't have trouble breathing, but my throat is swelling.",
+            "emergency",
+        ),
+        (
+            "I have no fever and chest pain.",
+            "emergency",
+        ),
+        (
+            "I have no fever and I have chest pain.",
+            "emergency",
+        ),
+        (
+            "I have no chest pain and trouble breathing.",
+            "other",
+        ),
+        (
+            "I had chest pain yesterday and I have chest pain.",
+            "emergency",
+        ),
+        (
+            "I don't have chest pain but I have trouble breathing.",
+            "emergency",
+        ),
+        (
+            "I have no fever, but I have chest pain.",
+            "emergency",
+        ),
+        (
+            "I have no chest pain, but I am struggling to breathe.",
             "emergency",
         ),
     ],
@@ -214,6 +245,7 @@ def test_clinic_hours_and_schedule_questions_are_not_bookings(text: str) -> None
         ("Can I schedule an appointment for Friday?", "book_appointment"),
         ("I need to book an appointment with a doctor.", "book_appointment"),
         ("I need to reschedule.", "reschedule_appointment"),
+        ("I want to reschedule my appointment.", "reschedule_appointment"),
         ("I am rescheduling my appointment.", "reschedule_appointment"),
         ("I want to change my appointment time.", "reschedule_appointment"),
         ("I need to move my appointment to Friday.", "reschedule_appointment"),
@@ -270,6 +302,39 @@ def test_cancellation_refusals_do_not_trigger_cancellation(text: str, expected: 
 )
 def test_appointment_refusals_do_not_trigger_booking(text: str) -> None:
     assert classify_intent(text) == "other"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I don't want to reschedule my appointment.",
+        "I do not need to reschedule my appointment.",
+        "I don't want to move my appointment.",
+        "I don't need to change my appointment.",
+        "I never said I wanted to reschedule.",
+    ],
+)
+def test_rescheduling_refusals_do_not_trigger_rescheduling(text: str) -> None:
+    assert classify_intent(text) == "other"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "I don't want to reschedule, but I need to book a new appointment.",
+            "book_appointment",
+        ),
+        (
+            "I don't want to reschedule, but I want to cancel.",
+            "cancel_appointment",
+        ),
+    ],
+)
+def test_rescheduling_refusal_preserves_separate_affirmative_action(
+    text: str, expected: Intent
+) -> None:
+    assert classify_intent(text) == expected
 
 
 @pytest.mark.parametrize(

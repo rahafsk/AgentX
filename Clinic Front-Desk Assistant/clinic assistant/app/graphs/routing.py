@@ -56,17 +56,89 @@ _EMERGENCY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_CLAUSE_BOUNDARY_PATTERN = re.compile(
-    r"[.;!?,]|\b(?:but|however|yet|although|though|except)\b",
+_STATEMENT_BOUNDARY_PATTERN = re.compile(
+    r"[.;!?,]|\b(?:but|however|yet|although|though|except)\b|"
+    r"\band\b(?=\s+(?:(?:now|then|also)\s+)?"
+    r"(?:i|you|he|she|we|they|my|his|her|their|our|the\s+patient|"
+    r"have|has|had|am|is|are|was|were|feel|feels|felt|can|could|do|does|did|"
+    r"need|want|would|will|stopped|struggling|struggle|choking|gasping|"
+    r"bleeding)\b)",
     re.IGNORECASE,
 )
 
-_NEGATION_PATTERN = re.compile(
+_NEGATION_WORD_PATTERN = re.compile(
     r"\b(?:no|not|never|without|deny|denies|denied|free\s+of|negative\s+for|"
     r"isn't|aren't|wasn't|weren't|don't|doesn't|didn't|haven't|hasn't|hadn't|"
-    r"can't|cannot|won't|wouldn't|no\s+longer)\b"
-    r"(?:\s+\w+){0,5}\s*$",
+    r"can't|cannot|won't|wouldn't|no\s+longer)\b",
     re.IGNORECASE,
+)
+
+_NEGATION_FILLER_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "a",
+        "all",
+        "also",
+        "am",
+        "an",
+        "and",
+        "any",
+        "are",
+        "at",
+        "be",
+        "been",
+        "being",
+        "believe",
+        "currently",
+        "did",
+        "do",
+        "does",
+        "even",
+        "ever",
+        "experience",
+        "experiencing",
+        "feel",
+        "feeling",
+        "feels",
+        "felt",
+        "for",
+        "had",
+        "has",
+        "have",
+        "having",
+        "her",
+        "his",
+        "history",
+        "i",
+        "if",
+        "in",
+        "is",
+        "much",
+        "my",
+        "now",
+        "of",
+        "on",
+        "our",
+        "really",
+        "right",
+        "severe",
+        "sharp",
+        "some",
+        "sure",
+        "terrible",
+        "that",
+        "the",
+        "their",
+        "them",
+        "think",
+        "this",
+        "to",
+        "today",
+        "was",
+        "we",
+        "were",
+        "with",
+        "your",
+    }
 )
 
 _HISTORICAL_PATTERN = re.compile(
@@ -124,6 +196,19 @@ _RESCHEDULE_PATTERN = re.compile(
     r"change\s+(?:my|the|this)\s+(?:appointment|booking)"
     r"(?:\s+(?:time|date|slot))?|"
     r"(?:push|postpone)\s+(?:back\s+)?(?:my|the|this)\s+(?:appointment|booking)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_RESCHEDULE_REFUSAL_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|will\s+not|won't|"
+    r"would\s+not|wouldn't|never|not)"
+    r"(?:\s+\w+){0,4}\s+"
+    r"(?:reschedul(?:e|ed|es|ing)|"
+    r"move\s+(?:my|the|this)\s+(?:appointment|booking)|"
+    r"change\s+(?:my|the|this)\s+(?:appointment|booking))|"
+    r"no\s+(?:need|intention|plans?)\s+to\s+(?:reschedule|move|change)\b"
     r")\b",
     re.IGNORECASE,
 )
@@ -328,20 +413,26 @@ def _normalized_text(text: str) -> str:
     return " ".join(text.replace("\u2019", "'").lower().split())
 
 
-def _clause_bounds(text: str, start: int, end: int) -> tuple[int, int]:
-    """Return the clause boundaries surrounding a match in normalized text."""
+def _statement_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    """Return statement boundaries around a match in normalized text.
 
-    clause_start = 0
-    clause_end = len(text)
+    Conjunctions only start a new statement when they introduce a new subject
+    or verb. This keeps one negation or historical marker from leaking into a
+    later affirmative symptom while preserving shared modifiers such as
+    "no chest pain and trouble breathing".
+    """
 
-    for boundary in _CLAUSE_BOUNDARY_PATTERN.finditer(text):
+    statement_start = 0
+    statement_end = len(text)
+
+    for boundary in _STATEMENT_BOUNDARY_PATTERN.finditer(text):
         if boundary.end() <= start:
-            clause_start = boundary.end()
+            statement_start = boundary.end()
         elif boundary.start() >= end:
-            clause_end = boundary.start()
+            statement_end = boundary.start()
             break
 
-    return clause_start, clause_end
+    return statement_start, statement_end
 
 
 def _is_historical_mention(clause: str, match_start: int, match_end: int) -> bool:
@@ -368,22 +459,46 @@ def _is_historical_mention(clause: str, match_start: int, match_end: int) -> boo
     return True
 
 
+def _negation_applies(prefix: str) -> bool:
+    """Return whether the nearest negation applies to the upcoming symptom."""
+
+    negation = None
+    for candidate in _NEGATION_WORD_PATTERN.finditer(prefix):
+        negation = candidate
+
+    if negation is None:
+        return False
+
+    between = prefix[negation.end() :]
+    if not between.strip():
+        return True
+
+    if re.search(r"\bor\b", between, re.IGNORECASE):
+        return True
+
+    if _EMERGENCY_PATTERN.search(between):
+        return True
+
+    words = re.findall(r"[a-z']+", between.lower())
+    return all(word in _NEGATION_FILLER_WORDS for word in words)
+
+
 def _has_current_emergency(text: str) -> bool:
     """Return whether the text contains an unnegated, current emergency mention."""
 
     for match in _EMERGENCY_PATTERN.finditer(text):
         start, end = match.span()
-        clause_start, clause_end = _clause_bounds(text, start, end)
-        prefix = text[clause_start:start]
+        statement_start, statement_end = _statement_bounds(text, start, end)
+        prefix = text[statement_start:start]
 
-        if _NEGATION_PATTERN.search(prefix):
+        if _negation_applies(prefix):
             continue
 
-        clause = text[clause_start:clause_end]
-        match_start = start - clause_start
-        match_end = end - clause_start
+        statement = text[statement_start:statement_end]
+        match_start = start - statement_start
+        match_end = end - statement_start
 
-        if _is_historical_mention(clause, match_start, match_end):
+        if _is_historical_mention(statement, match_start, match_end):
             continue
 
         return True
@@ -442,7 +557,9 @@ def classify_intent(text: str) -> Intent:
     cancel_requested = bool(_CANCEL_PATTERN.search(normalized)) and not bool(
         _CANCEL_REFUSAL_PATTERN.search(normalized)
     )
-    reschedule_requested = bool(_RESCHEDULE_PATTERN.search(normalized))
+    reschedule_requested = bool(_RESCHEDULE_PATTERN.search(normalized)) and not bool(
+        _RESCHEDULE_REFUSAL_PATTERN.search(normalized)
+    )
     appointment_refused = bool(_APPOINTMENT_REFUSAL_PATTERN.search(normalized))
     book_requested = (
         bool(_BOOK_PATTERN.search(normalized))
