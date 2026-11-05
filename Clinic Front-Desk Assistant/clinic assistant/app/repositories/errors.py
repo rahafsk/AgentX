@@ -25,6 +25,10 @@ class BookingConflict(RepositoryError):
     """A slot already has an active booking."""
 
 
+class ApprovalWorkflowRequired(RepositoryError):
+    """The booking requires a checkpointed staff-approval workflow."""
+
+
 class SlotUnavailable(RepositoryError):
     """A booking targets a blocked slot or a slot for an inactive doctor."""
 

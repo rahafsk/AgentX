@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     thread_id TEXT NOT NULL UNIQUE,
     -- Opaque ID from authenticated API context; never a patient name or message.
     owner_reference TEXT,
+    -- Stable key used to replay conversation-creation requests.
+    creation_request_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT conversations_thread_id_not_blank CHECK (BTRIM(thread_id) <> ''),
@@ -66,6 +68,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 -- Existing conversations remain unowned until an authenticated migration or service assigns them.
 ALTER TABLE conversations
     ADD COLUMN IF NOT EXISTS owner_reference TEXT;
+ALTER TABLE conversations
+    ADD COLUMN IF NOT EXISTS creation_request_id UUID;
 
 DO $migration$
 BEGIN
@@ -81,6 +85,10 @@ BEGIN
     END IF;
 END;
 $migration$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS conversations_owner_creation_request_idx
+    ON conversations (owner_reference, creation_request_id)
+    WHERE creation_request_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS bookings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

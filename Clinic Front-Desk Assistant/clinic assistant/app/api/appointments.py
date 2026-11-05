@@ -1,41 +1,29 @@
-"""HTTP endpoints for searching slots, creating bookings, and requesting cancellations."""
+"""HTTP endpoints for slot search and checkpointed appointment actions."""
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Annotated, Protocol, cast
+from typing import Annotated, Literal, Protocol, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from pydantic import BaseModel, ConfigDict
 
+from app.api.dependencies import IdempotencyKey, OwnerReferenceDependency
 from app.repositories.appointments import MAX_SEARCH_LIMIT
-from app.repositories.errors import (
-    ApprovalAlreadyPending,
-    ApprovalStateConflict,
-    BookingConflict,
-    ConversationNotFound,
-    SlotUnavailable,
-)
-from app.repositories.models import (
-    Approval,
-    ApprovalAction,
-    ApprovalStatus,
-    AvailableAppointmentSlot,
-    Booking,
-    BookingStatus,
-)
-from app.services.appointments import (
-    DEFAULT_SEARCH_LIMIT,
-    BookingConversationMismatch,
-    BookingNotFound,
-)
+from app.repositories.errors import ConversationNotFound
+from app.repositories.models import ApprovalStatus, AvailableAppointmentSlot, BookingStatus
+from app.services.appointments import DEFAULT_SEARCH_LIMIT
+from app.services.conversations import ConversationProcessingError
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
 
 class AppointmentServiceProtocol(Protocol):
-    """Service operations required by the appointment API."""
+    """Read-only slot-search operation used directly by this HTTP router."""
 
     def search_available_slots(
         self,
@@ -46,20 +34,20 @@ class AppointmentServiceProtocol(Protocol):
         limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> list[AvailableAppointmentSlot]: ...
 
-    def book_appointment(
+
+class AppointmentWorkflowProtocol(Protocol):
+    """Checkpointed booking/cancellation operations routed through LangGraph."""
+
+    async def process_appointment_action(
         self,
-        slot_id: UUID,
-        patient_reference: str,
         conversation_id: UUID,
         *,
-        requires_approval: bool = False,
-    ) -> Booking: ...
-
-    def request_cancellation(
-        self,
-        booking_id: UUID,
-        conversation_id: UUID,
-    ) -> Approval: ...
+        owner_reference: str,
+        request_id: UUID,
+        action: Literal["book", "cancel"],
+        slot_id: UUID | None = None,
+        booking_id: UUID | None = None,
+    ) -> Mapping[str, object]: ...
 
 
 class AvailableSlotResponse(BaseModel):
@@ -74,7 +62,6 @@ class AvailableSlotResponse(BaseModel):
 
     @classmethod
     def from_slot(cls, slot: AvailableAppointmentSlot) -> AvailableSlotResponse:
-        """Build a response from a repository slot record."""
         return cls(
             id=slot.id,
             doctor_id=slot.doctor_id,
@@ -86,86 +73,45 @@ class AvailableSlotResponse(BaseModel):
 
 
 class BookingRequest(BaseModel):
-    """A request to reserve an open appointment slot."""
+    """A slot request; patient identity comes from authentication, not JSON."""
+
+    model_config = ConfigDict(extra="forbid")
 
     slot_id: UUID
-    patient_reference: str = Field(min_length=1)
     conversation_id: UUID
-    requires_approval: bool = False
-
-    @field_validator("patient_reference")
-    @classmethod
-    def reject_blank_patient_reference(cls, value: str) -> str:
-        """Strip surrounding whitespace and reject an empty reference."""
-        patient_reference = value.strip()
-        if not patient_reference:
-            raise ValueError("Patient reference cannot be blank.")
-        return patient_reference
 
 
 class BookingResponse(BaseModel):
-    """A booking, including whether it is awaiting staff approval."""
+    """A booking outcome returned after its workflow turn is checkpointed."""
 
     id: UUID
     slot_id: UUID
-    conversation_id: UUID | None
-    patient_reference: str
+    conversation_id: UUID
     status: BookingStatus
-    created_at: datetime
-    updated_at: datetime
-
-    @classmethod
-    def from_booking(cls, booking: Booking) -> BookingResponse:
-        """Build a response from a repository booking record."""
-        return cls(
-            id=booking.id,
-            slot_id=booking.slot_id,
-            conversation_id=booking.conversation_id,
-            patient_reference=booking.patient_reference,
-            status=booking.status,
-            created_at=booking.created_at,
-            updated_at=booking.updated_at,
-        )
+    response: str
 
 
 class CancellationRequest(BaseModel):
-    """A request to cancel a confirmed booking with staff approval."""
+    """A request to cancel an existing booking in its conversation."""
+
+    model_config = ConfigDict(extra="forbid")
 
     booking_id: UUID
     conversation_id: UUID
 
 
 class ApprovalResponse(BaseModel):
-    """A staff approval request, including its pending or decided state."""
+    """A checkpointed cancellation approval request."""
 
     id: UUID
     booking_id: UUID
     conversation_id: UUID
-    action: ApprovalAction
     status: ApprovalStatus
-    requested_at: datetime
-    decided_at: datetime | None
-    decided_by: str | None
-    decision_note: str | None
-
-    @classmethod
-    def from_approval(cls, approval: Approval) -> ApprovalResponse:
-        """Build a response from a repository approval record."""
-        return cls(
-            id=approval.id,
-            booking_id=approval.booking_id,
-            conversation_id=approval.conversation_id,
-            action=approval.action,
-            status=approval.status,
-            requested_at=approval.requested_at,
-            decided_at=approval.decided_at,
-            decided_by=approval.decided_by,
-            decision_note=approval.decision_note,
-        )
+    response: str
 
 
 def get_appointment_service(request: Request) -> AppointmentServiceProtocol:
-    """Return the configured appointment service from application state."""
+    """Return the configured slot-search service."""
     service = getattr(request.app.state, "appointment_service", None)
     if service is None:
         raise HTTPException(
@@ -175,14 +121,28 @@ def get_appointment_service(request: Request) -> AppointmentServiceProtocol:
     return cast(AppointmentServiceProtocol, service)
 
 
+def get_appointment_workflow(request: Request) -> AppointmentWorkflowProtocol:
+    """Return the conversation service that executes checkpointed appointment actions."""
+    service = getattr(request.app.state, "conversation_service", None)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Conversation workflow is not configured.",
+        )
+    return cast(AppointmentWorkflowProtocol, service)
+
+
 AppointmentServiceDependency = Annotated[
     AppointmentServiceProtocol,
     Depends(get_appointment_service),
 ]
+AppointmentWorkflowDependency = Annotated[
+    AppointmentWorkflowProtocol,
+    Depends(get_appointment_workflow),
+]
 
 
 def _require_aware_datetime(value: datetime, field_name: str) -> None:
-    """Reject a query datetime that does not include timezone information."""
     if value.tzinfo is None or value.utcoffset() is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -191,14 +151,45 @@ def _require_aware_datetime(value: datetime, field_name: str) -> None:
 
 
 def _validate_search_range(starts_at: datetime, ends_at: datetime) -> None:
-    """Validate the requested slot-search time range."""
     _require_aware_datetime(starts_at, "starts_at")
     _require_aware_datetime(ends_at, "ends_at")
-
     if ends_at <= starts_at:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="ends_at must be later than starts_at.",
+        )
+
+
+def _raise_workflow_error(error: object, request_id: UUID) -> None:
+    """Translate appointment-domain outcomes without exposing raw DB errors."""
+    if error == "booking_conflict":
+        raise HTTPException(status_code=409, detail="The appointment slot is already booked.")
+    if error == "slot_unavailable":
+        raise HTTPException(status_code=409, detail="The selected appointment slot is unavailable.")
+    if error == "conversation_not_found":
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if error == "booking_not_found":
+        raise HTTPException(status_code=404, detail="Booking not found.")
+    if error == "booking_conversation_mismatch":
+        raise HTTPException(status_code=409, detail="The booking belongs to another conversation.")
+    if error == "approval_already_pending":
+        raise HTTPException(status_code=409, detail="A staff request is already pending.")
+    if error == "approval_state_conflict":
+        raise HTTPException(status_code=409, detail="The booking is not in a cancellable state.")
+    if error == "approval_workflow_required":
+        raise HTTPException(
+            status_code=503,
+            detail="This request requires a configured staff-approval workflow.",
+        )
+    if error:
+        logger.error(
+            "Appointment workflow failed (request_id=%s, error_type=%s)",
+            request_id,
+            error if isinstance(error, str) else type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="The assistant could not process the appointment request.",
         )
 
 
@@ -213,16 +204,11 @@ def search_slots(
     ] = None,
     limit: Annotated[
         int,
-        Query(
-            ge=1,
-            le=MAX_SEARCH_LIMIT,
-            description="Maximum number of slots to return.",
-        ),
+        Query(ge=1, le=MAX_SEARCH_LIMIT, description="Maximum number of slots to return."),
     ] = DEFAULT_SEARCH_LIMIT,
 ) -> list[AvailableSlotResponse]:
     """Return open appointment slots within the requested time range."""
     _validate_search_range(starts_at, ends_at)
-
     try:
         slots = service.search_available_slots(
             starts_at,
@@ -231,11 +217,7 @@ def search_slots(
             limit=limit,
         )
     except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        ) from exc
-
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return [AvailableSlotResponse.from_slot(slot) for slot in slots]
 
 
@@ -244,81 +226,121 @@ def search_slots(
     response_model=BookingResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_booking(
+async def create_booking(
     payload: BookingRequest,
-    service: AppointmentServiceDependency,
+    service: AppointmentWorkflowDependency,
+    owner_reference: OwnerReferenceDependency,
+    request_id: IdempotencyKey,
+    response: Response,
 ) -> BookingResponse:
-    """Book an open slot and preserve any required staff-approval status."""
+    """Submit through LangGraph so approval-required bookings are checkpointed."""
     try:
-        booking = service.book_appointment(
-            payload.slot_id,
-            payload.patient_reference,
+        result = await service.process_appointment_action(
             payload.conversation_id,
-            requires_approval=payload.requires_approval,
+            owner_reference=owner_reference,
+            request_id=request_id,
+            action="book",
+            slot_id=payload.slot_id,
         )
-    except BookingConflict as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The appointment slot already has an active booking.",
-        ) from exc
-    except SlotUnavailable as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The selected appointment slot is unavailable.",
-        ) from exc
     except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from exc
+    except ConversationProcessingError as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conversation not found.",
+            status_code=503,
+            detail="The request could not be resumed; retry with the same Idempotency-Key.",
         ) from exc
     except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _raise_workflow_error(result.get("workflow_error"), request_id)
 
-    return BookingResponse.from_booking(booking)
-
-
-@router.post(
-    "/cancellations",
-    response_model=ApprovalResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def request_cancellation(
-    payload: CancellationRequest,
-    service: AppointmentServiceDependency,
-) -> ApprovalResponse:
-    """Request staff approval to cancel a confirmed booking."""
+    booking_id = result.get("booking_id")
+    booking_status = result.get("booking_status")
+    response_text = result.get("response")
+    if not isinstance(booking_id, str) or booking_status not in {
+        "pending_approval",
+        "confirmed",
+        "cancelled",
+        "rejected",
+    }:
+        logger.error("Booking workflow returned incomplete state (request_id=%s)", request_id)
+        raise HTTPException(status_code=500, detail="The assistant could not process the booking.")
+    if not isinstance(response_text, str) or not response_text.strip():
+        response_text = "Your booking request was processed."
     try:
-        approval = service.request_cancellation(
-            payload.booking_id,
-            payload.conversation_id,
-        )
-    except BookingNotFound as exc:
+        parsed_booking_id = UUID(booking_id)
+    except ValueError as exc:
+        logger.error("Booking workflow returned an invalid ID (request_id=%s)", request_id)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Booking not found.",
-        ) from exc
-    except BookingConversationMismatch as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The booking belongs to a different conversation.",
-        ) from exc
-    except ApprovalAlreadyPending as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A cancellation request for this booking is already pending.",
-        ) from exc
-    except ApprovalStateConflict as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Only confirmed bookings can be cancelled.",
-        ) from exc
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
+            status_code=500, detail="The assistant could not process the booking."
         ) from exc
 
-    return ApprovalResponse.from_approval(approval)
+    if booking_status == "pending_approval":
+        response.status_code = status.HTTP_202_ACCEPTED
+    return BookingResponse(
+        id=parsed_booking_id,
+        slot_id=payload.slot_id,
+        conversation_id=payload.conversation_id,
+        status=cast(BookingStatus, booking_status),
+        response=response_text,
+    )
+
+
+@router.post("/cancellations", response_model=ApprovalResponse)
+async def request_cancellation(
+    payload: CancellationRequest,
+    service: AppointmentWorkflowDependency,
+    owner_reference: OwnerReferenceDependency,
+    request_id: IdempotencyKey,
+    response: Response,
+) -> ApprovalResponse:
+    """Submit cancellation through LangGraph and pause durably for staff review."""
+    try:
+        result = await service.process_appointment_action(
+            payload.conversation_id,
+            owner_reference=owner_reference,
+            request_id=request_id,
+            action="cancel",
+            booking_id=payload.booking_id,
+        )
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found.") from exc
+    except ConversationProcessingError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The request could not be resumed; retry with the same Idempotency-Key.",
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _raise_workflow_error(result.get("workflow_error"), request_id)
+
+    approval_id = result.get("approval_id")
+    approval_status = result.get("approval_status")
+    response_text = result.get("response")
+    if not isinstance(approval_id, str) or approval_status not in {
+        "pending",
+        "approved",
+        "rejected",
+    }:
+        logger.error("Cancellation workflow returned incomplete state (request_id=%s)", request_id)
+        raise HTTPException(
+            status_code=500, detail="The assistant could not process the cancellation."
+        )
+    if not isinstance(response_text, str) or not response_text.strip():
+        response_text = "Your cancellation request is waiting for staff review."
+    try:
+        parsed_approval_id = UUID(approval_id)
+    except ValueError as exc:
+        logger.error("Cancellation workflow returned an invalid ID (request_id=%s)", request_id)
+        raise HTTPException(
+            status_code=500, detail="The assistant could not process the cancellation."
+        ) from exc
+
+    if approval_status == "pending":
+        response.status_code = status.HTTP_202_ACCEPTED
+    return ApprovalResponse(
+        id=parsed_approval_id,
+        booking_id=payload.booking_id,
+        conversation_id=payload.conversation_id,
+        status=cast(ApprovalStatus, approval_status),
+        response=response_text,
+    )

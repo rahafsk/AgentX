@@ -6,6 +6,9 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 
 ### Added
 
+- Add owner-scoped conversation and appointment APIs with UUID idempotency keys, trusted caller identity, and checkpointed booking/cancellation actions.
+- Add staff approval queue and decision endpoints that update booking records and resume paused LangGraph threads.
+- Reject elapsed appointment slots and replay booking/approval actions safely after a database commit.
 - Add owner-scoped conversation processing with request IDs, bounded history, approval-pending replies, and workflow timeouts.
 - Add a local Docker Compose setup for the FastAPI service and PostgreSQL, with health checks, initialization, and persistent database storage.
 - Scaffold the backend package structure for the API, LangGraph workflows, services, repositories, RAG, database, tests, and documentation.
@@ -22,6 +25,6 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 
 ### In progress
 
-- Conversation, appointment, and approval APIs and graph workflows remain in development.
-- Full API-to-workflow integration and end-to-end deployment are still in progress.
+- The embedding host must provide trusted owner and staff authentication resolvers; authentication-provider integration is not included here.
+- Full deployment integration remains in progress.
 - No versioned release has been published yet.

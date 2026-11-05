@@ -1,9 +1,10 @@
 """Shared locking order for booking and approval operations."""
-#_locks.py is a helper file shared by bookings.py and approvals.py.
-#A lock temporarily prevents another transaction from changing the same database row. Both repositories should acquire locks in the same order:
-#Doctor → Appointment slot → Booking → Approval
-#Using different orders can cause a deadlock, where two transactions wait for each other.
-#The shared file keeps this logic in one place. It does not create a new database table or repository.
+
+# _locks.py is a helper file shared by bookings.py and approvals.py.
+# A lock temporarily prevents another transaction from changing the same database row. Both repositories should acquire locks in the same order:
+# Doctor → Appointment slot → Booking → Approval
+# Using different orders can cause a deadlock, where two transactions wait for each other.
+# The shared file keeps this logic in one place. It does not create a new database table or repository.
 from typing import Any
 from uuid import UUID
 

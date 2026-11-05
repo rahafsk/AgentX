@@ -30,6 +30,7 @@ from app.services.appointments import (
 )
 
 _NOW = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
+_OWNER_REFERENCE = "fictional-patient"
 
 
 def _slot(
@@ -129,14 +130,16 @@ class _FakeBookingRepository:
         patient_reference: str,
         *,
         conversation_id: UUID | None = None,
-        requires_approval: bool = False,
+        approval_workflow: bool = False,
+        request_id: UUID | None = None,
     ) -> Booking:
         self.create_calls.append(
             {
                 "slot_id": slot_id,
                 "patient_reference": patient_reference,
                 "conversation_id": conversation_id,
-                "requires_approval": requires_approval,
+                "approval_workflow": approval_workflow,
+                "request_id": request_id,
             }
         )
         if self.create_error is not None:
@@ -185,23 +188,42 @@ class _FakeApprovalRepository:
 
 
 class _FakeConversationRepository:
-    def __init__(self, conversations: list[Conversation] | None = None) -> None:
+    def __init__(
+        self,
+        conversations: list[Conversation] | None = None,
+        *,
+        allow_any: bool = False,
+    ) -> None:
         self._conversations = {
             conversation.id: conversation for conversation in conversations or []
         }
+        self._allow_any = allow_any
         self.calls: list[UUID] = []
 
-    def get(self, conversation_id: UUID) -> Conversation | None:
+    def get_for_owner(
+        self,
+        conversation_id: UUID,
+        owner_reference: str,
+    ) -> Conversation | None:
         self.calls.append(conversation_id)
-        return self._conversations.get(conversation_id)
+        conversation = self._conversations.get(conversation_id)
+        if conversation is not None and conversation.owner_reference == owner_reference:
+            return conversation
+        if self._allow_any:
+            return _conversation(conversation_id, owner_reference)
+        return None
 
 
-def _conversation(conversation_id: UUID) -> Conversation:
+def _conversation(
+    conversation_id: UUID,
+    owner_reference: str = "fictional-patient",
+) -> Conversation:
     return Conversation(
         id=conversation_id,
         thread_id=str(conversation_id),
         created_at=_NOW,
         updated_at=_NOW,
+        owner_reference=owner_reference,
     )
 
 
@@ -216,7 +238,7 @@ def _service(
         appointments or _FakeAppointmentRepository(),  # type: ignore[arg-type]
         bookings or _FakeBookingRepository(),  # type: ignore[arg-type]
         approvals or _FakeApprovalRepository(),  # type: ignore[arg-type]
-        conversations,  # type: ignore[arg-type]
+        conversations or _FakeConversationRepository(allow_any=True),  # type: ignore[arg-type]
     )
 
 
@@ -346,11 +368,13 @@ def test_book_appointment_delegates_to_repository() -> None:
     slot_id = uuid4()
     conversation_id = booking.conversation_id
     assert conversation_id is not None
+    request_id = uuid4()
 
     result = service.book_appointment(
         slot_id,
         "  fictional-patient  ",
         conversation_id,
+        request_id=request_id,
     )
 
     assert result is booking
@@ -359,7 +383,8 @@ def test_book_appointment_delegates_to_repository() -> None:
             "slot_id": slot_id,
             "patient_reference": "fictional-patient",
             "conversation_id": conversation_id,
-            "requires_approval": False,
+            "approval_workflow": False,
+            "request_id": request_id,
         }
     ]
     assert approvals.create_calls == []
@@ -373,10 +398,15 @@ def test_book_appointment_returns_pending_booking_for_same_day_approval() -> Non
     conversation_id = booking.conversation_id
     assert conversation_id is not None
 
-    result = service.book_appointment(uuid4(), "fictional-patient", conversation_id)
+    result = service.book_appointment(
+        uuid4(),
+        "fictional-patient",
+        conversation_id,
+        approval_workflow=True,
+    )
 
     assert result.status == "pending_approval"
-    assert bookings.create_calls[0]["requires_approval"] is False
+    assert bookings.create_calls[0]["approval_workflow"] is True
     # BookingRepository creates the approval; the service must not duplicate it.
     assert approvals.create_calls == []
 
@@ -392,10 +422,10 @@ def test_book_appointment_passes_explicit_approval_requirement() -> None:
         uuid4(),
         "fictional-patient",
         conversation_id,
-        requires_approval=True,
+        approval_workflow=True,
     )
 
-    assert bookings.create_calls[0]["requires_approval"] is True
+    assert bookings.create_calls[0]["approval_workflow"] is True
 
 
 def test_book_appointment_propagates_booking_conflict() -> None:
@@ -443,17 +473,20 @@ def test_book_appointment_rejects_missing_conversation() -> None:
     assert bookings.create_calls == []
 
 
-def test_book_appointment_skips_conversation_lookup_without_repository() -> None:
+def test_book_appointment_requires_owner_bound_conversation() -> None:
     booking = _booking()
     bookings = _FakeBookingRepository(create_result=booking)
-    service = _service(bookings=bookings)
     conversation_id = booking.conversation_id
     assert conversation_id is not None
+    service = _service(
+        bookings=bookings,
+        conversations=_FakeConversationRepository(),
+    )
 
-    result = service.book_appointment(uuid4(), "fictional-patient", conversation_id)
+    with pytest.raises(ConversationNotFound):
+        service.book_appointment(uuid4(), "fictional-patient", conversation_id)
 
-    assert result is booking
-    assert len(bookings.create_calls) == 1
+    assert bookings.create_calls == []
 
 
 @pytest.mark.parametrize(
@@ -488,12 +521,12 @@ def test_book_appointment_rejects_invalid_approval_flag() -> None:
     bookings = _FakeBookingRepository(create_result=_booking())
     service = _service(bookings=bookings)
 
-    with pytest.raises(TypeError, match="requires_approval"):
+    with pytest.raises(TypeError, match="approval_workflow"):
         service.book_appointment(
             uuid4(),
             "fictional-patient",
             uuid4(),
-            requires_approval="yes",  # type: ignore[arg-type]
+            approval_workflow="yes",  # type: ignore[arg-type]
         )
 
     assert bookings.create_calls == []
@@ -509,8 +542,14 @@ def test_request_cancellation_creates_pending_approval() -> None:
     bookings = _FakeBookingRepository([booking])
     approvals = _FakeApprovalRepository(approval)
     service = _service(bookings=bookings, approvals=approvals)
+    request_id = uuid4()
 
-    result = service.request_cancellation(booking.id, conversation_id)
+    result = service.request_cancellation(
+        booking.id,
+        conversation_id,
+        _OWNER_REFERENCE,
+        request_id=request_id,
+    )
 
     assert result is approval
     assert bookings.get_calls == [booking.id]
@@ -519,7 +558,7 @@ def test_request_cancellation_creates_pending_approval() -> None:
             "booking_id": booking.id,
             "conversation_id": conversation_id,
             "action": "cancel_booking",
-            "request_id": None,
+            "request_id": request_id,
         }
     ]
 
@@ -531,7 +570,7 @@ def test_request_cancellation_rejects_missing_booking() -> None:
     booking_id = uuid4()
 
     with pytest.raises(BookingNotFound):
-        service.request_cancellation(booking_id, uuid4())
+        service.request_cancellation(booking_id, uuid4(), _OWNER_REFERENCE)
 
     assert bookings.get_calls == [booking_id]
     assert approvals.create_calls == []
@@ -544,7 +583,7 @@ def test_request_cancellation_rejects_another_conversation() -> None:
     service = _service(bookings=bookings, approvals=approvals)
 
     with pytest.raises(BookingConversationMismatch):
-        service.request_cancellation(booking.id, uuid4())
+        service.request_cancellation(booking.id, uuid4(), _OWNER_REFERENCE)
 
     assert bookings.get_calls == [booking.id]
     assert approvals.create_calls == []
@@ -559,7 +598,7 @@ def test_request_cancellation_propagates_already_pending_approval() -> None:
     service = _service(bookings=bookings, approvals=approvals)
 
     with pytest.raises(ApprovalAlreadyPending):
-        service.request_cancellation(booking.id, conversation_id)
+        service.request_cancellation(booking.id, conversation_id, _OWNER_REFERENCE)
 
 
 def test_request_cancellation_propagates_booking_state_conflict() -> None:
@@ -573,7 +612,7 @@ def test_request_cancellation_propagates_booking_state_conflict() -> None:
     service = _service(bookings=bookings, approvals=approvals)
 
     with pytest.raises(ApprovalStateConflict):
-        service.request_cancellation(booking.id, conversation_id)
+        service.request_cancellation(booking.id, conversation_id, _OWNER_REFERENCE)
 
 
 @pytest.mark.parametrize(
@@ -595,6 +634,7 @@ def test_request_cancellation_rejects_invalid_ids(
         service.request_cancellation(
             booking_id,  # type: ignore[arg-type]
             conversation_id,  # type: ignore[arg-type]
+            _OWNER_REFERENCE,
         )
 
     assert bookings.get_calls == []

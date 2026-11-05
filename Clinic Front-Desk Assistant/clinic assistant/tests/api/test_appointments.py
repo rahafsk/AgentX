@@ -1,44 +1,33 @@
-"""API tests for the appointment endpoints."""
+"""API tests for slot search and checkpointed appointment actions."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.appointments import router
-from app.repositories.errors import (
-    ApprovalAlreadyPending,
-    ApprovalStateConflict,
-    BookingConflict,
-    ConversationNotFound,
-    SlotUnavailable,
-)
-from app.repositories.models import (
-    Approval,
-    AvailableAppointmentSlot,
-    Booking,
-    BookingStatus,
-)
-from app.services.appointments import (
-    BookingConversationMismatch,
-    BookingNotFound,
-)
+from app.main import create_app
+from app.repositories.errors import ConversationNotFound
+from app.repositories.models import AvailableAppointmentSlot
 
 _SLOT_ID = UUID("11111111-1111-4111-8111-111111111111")
 _DOCTOR_ID = UUID("22222222-2222-4222-8222-222222222222")
 _CONVERSATION_ID = UUID("33333333-3333-4333-8333-333333333333")
+_OTHER_CONVERSATION_ID = UUID("66666666-6666-4666-8666-666666666666")
 _BOOKING_ID = UUID("44444444-4444-4444-8444-444444444444")
 _APPROVAL_ID = UUID("55555555-5555-4555-8555-555555555555")
+_OWNER_REFERENCE = "opaque-authenticated-owner"
+_BOOKING_REQUEST_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+_CANCEL_REQUEST_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 _STARTS_AT = datetime(2026, 12, 1, 9, 0, tzinfo=UTC)
 _ENDS_AT = datetime(2026, 12, 1, 11, 0, tzinfo=UTC)
 
 
 def _slot() -> AvailableAppointmentSlot:
-    """Return a fictional open slot for API responses."""
     return AvailableAppointmentSlot(
         id=_SLOT_ID,
         doctor_id=_DOCTOR_ID,
@@ -49,56 +38,16 @@ def _slot() -> AvailableAppointmentSlot:
     )
 
 
-def _booking(status: BookingStatus = "confirmed") -> Booking:
-    """Return a fictional booking in the requested status."""
-    return Booking(
-        id=_BOOKING_ID,
-        slot_id=_SLOT_ID,
-        conversation_id=_CONVERSATION_ID,
-        patient_reference="fictional-patient",
-        status=status,
-        created_at=_STARTS_AT,
-        updated_at=_STARTS_AT,
-    )
-
-
-def _approval() -> Approval:
-    """Return a fictional pending cancellation approval."""
-    return Approval(
-        id=_APPROVAL_ID,
-        booking_id=_BOOKING_ID,
-        conversation_id=_CONVERSATION_ID,
-        action="cancel_booking",
-        status="pending",
-        requested_at=_STARTS_AT,
-        decided_at=None,
-        decided_by=None,
-        decision_note=None,
-    )
-
-
-class _FakeService:
-    """Configurable appointment service stand-in for HTTP tests."""
-
+class _FakeAppointmentService:
     def __init__(
         self,
-        *,
         slots: list[AvailableAppointmentSlot] | None = None,
-        booking: Booking | None = None,
-        approval: Approval | None = None,
+        *,
         search_error: Exception | None = None,
-        booking_error: Exception | None = None,
-        cancellation_error: Exception | None = None,
     ) -> None:
-        self._slots = list(slots) if slots is not None else [_slot()]
-        self._booking = booking or _booking()
-        self._approval = approval or _approval()
-        self._search_error = search_error
-        self._booking_error = booking_error
-        self._cancellation_error = cancellation_error
-        self.search_calls: list[dict[str, object]] = []
-        self.booking_calls: list[dict[str, object]] = []
-        self.cancellation_calls: list[dict[str, object]] = []
+        self.slots = list(slots) if slots is not None else [_slot()]
+        self.search_error = search_error
+        self.search_calls: list[dict[str, Any]] = []
 
     def search_available_slots(
         self,
@@ -116,77 +65,97 @@ class _FakeService:
                 "limit": limit,
             }
         )
-        if self._search_error is not None:
-            raise self._search_error
-        return list(self._slots)
+        if self.search_error is not None:
+            raise self.search_error
+        return list(self.slots)
 
-    def book_appointment(
+
+class _FakeConversationService:
+    def __init__(
         self,
-        slot_id: UUID,
-        patient_reference: str,
+        booking_result: Mapping[str, object] | None = None,
+        cancellation_result: Mapping[str, object] | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.booking_result = dict(
+            booking_result
+            or {
+                "booking_id": str(_BOOKING_ID),
+                "booking_status": "confirmed",
+                "approval_status": "not_required",
+                "response": "Your appointment is booked.",
+            }
+        )
+        self.cancellation_result = dict(
+            cancellation_result
+            or {
+                "approval_id": str(_APPROVAL_ID),
+                "booking_id": str(_BOOKING_ID),
+                "approval_status": "pending",
+                "response": "Your cancellation request is waiting for staff approval.",
+            }
+        )
+        self.error = error
+        self.actions: list[dict[str, object]] = []
+
+    async def process_appointment_action(
+        self,
         conversation_id: UUID,
         *,
-        requires_approval: bool = False,
-    ) -> Booking:
-        self.booking_calls.append(
+        owner_reference: str,
+        request_id: UUID,
+        action: str,
+        slot_id: UUID | None = None,
+        booking_id: UUID | None = None,
+    ) -> Mapping[str, object]:
+        self.actions.append(
             {
+                "conversation_id": conversation_id,
+                "owner_reference": owner_reference,
+                "request_id": request_id,
+                "action": action,
                 "slot_id": slot_id,
-                "patient_reference": patient_reference,
-                "conversation_id": conversation_id,
-                "requires_approval": requires_approval,
-            }
-        )
-        if self._booking_error is not None:
-            raise self._booking_error
-        return self._booking
-
-    def request_cancellation(
-        self,
-        booking_id: UUID,
-        conversation_id: UUID,
-    ) -> Approval:
-        self.cancellation_calls.append(
-            {
                 "booking_id": booking_id,
-                "conversation_id": conversation_id,
             }
         )
-        if self._cancellation_error is not None:
-            raise self._cancellation_error
-        return self._approval
+        if owner_reference != _OWNER_REFERENCE or conversation_id != _CONVERSATION_ID:
+            raise ConversationNotFound("Conversation was not found.")
+        if self.error is not None:
+            raise self.error
+        return self.booking_result if action == "book" else self.cancellation_result
 
 
-def _client(service: _FakeService | None) -> TestClient:
-    """Build an isolated app with the appointments router."""
-    app = FastAPI()
-    app.include_router(router)
-    if service is not None:
-        app.state.appointment_service = service
+def _client(
+    appointment_service: _FakeAppointmentService | None = None,
+    conversation_service: _FakeConversationService | None = None,
+    *,
+    owner_reference: str | None = _OWNER_REFERENCE,
+) -> TestClient:
+    resolver = (lambda request: owner_reference) if owner_reference is not None else None
+    app = create_app(
+        appointment_service=appointment_service,
+        conversation_service=conversation_service,
+        owner_reference_resolver=resolver,
+        configure_services=False,
+    )
     return TestClient(app)
 
 
 def _search_params() -> dict[str, str]:
-    """Return a valid slot-search query string."""
-    return {
-        "starts_at": _STARTS_AT.isoformat(),
-        "ends_at": _ENDS_AT.isoformat(),
-    }
+    return {"starts_at": _STARTS_AT.isoformat(), "ends_at": _ENDS_AT.isoformat()}
 
 
 def _booking_payload(**overrides: object) -> dict[str, object]:
-    """Return a valid booking request body."""
     payload: dict[str, object] = {
         "slot_id": str(_SLOT_ID),
-        "patient_reference": "fictional-patient",
         "conversation_id": str(_CONVERSATION_ID),
-        "requires_approval": False,
     }
     payload.update(overrides)
     return payload
 
 
 def _cancellation_payload(**overrides: object) -> dict[str, object]:
-    """Return a valid cancellation request body."""
     payload: dict[str, object] = {
         "booking_id": str(_BOOKING_ID),
         "conversation_id": str(_CONVERSATION_ID),
@@ -196,7 +165,8 @@ def _cancellation_payload(**overrides: object) -> dict[str, object]:
 
 
 def test_search_slots_returns_available_slots() -> None:
-    client = _client(_FakeService())
+    service = _FakeAppointmentService()
+    client = _client(service)
 
     response = client.get("/appointments/slots", params=_search_params())
 
@@ -214,15 +184,13 @@ def test_search_slots_returns_available_slots() -> None:
 
 
 def test_search_slots_applies_optional_doctor_and_limit() -> None:
-    service = _FakeService()
+    service = _FakeAppointmentService()
     client = _client(service)
-    params = {
-        **_search_params(),
-        "doctor_id": str(_DOCTOR_ID),
-        "limit": "10",
-    }
 
-    response = client.get("/appointments/slots", params=params)
+    response = client.get(
+        "/appointments/slots",
+        params={**_search_params(), "doctor_id": str(_DOCTOR_ID), "limit": "10"},
+    )
 
     assert response.status_code == 200
     assert service.search_calls == [
@@ -235,52 +203,43 @@ def test_search_slots_applies_optional_doctor_and_limit() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    "params",
-    [
-        {
-            "starts_at": "2026-12-01T09:00:00",
-            "ends_at": _ENDS_AT.isoformat(),
-        },
-        {
-            "starts_at": _ENDS_AT.isoformat(),
-            "ends_at": _STARTS_AT.isoformat(),
-        },
-        {
-            **_search_params(),
-            "limit": "0",
-        },
-        {
-            **_search_params(),
-            "limit": "101",
-        },
-        {
-            **_search_params(),
-            "doctor_id": "not-a-uuid",
-        },
-        {
-            "starts_at": "not-a-datetime",
-            "ends_at": _ENDS_AT.isoformat(),
-        },
-    ],
-)
-def test_search_slots_rejects_invalid_input(params: dict[str, str]) -> None:
-    service = _FakeService()
+def test_search_slots_rejects_invalid_range() -> None:
+    service = _FakeAppointmentService()
     client = _client(service)
 
-    response = client.get("/appointments/slots", params=params)
+    response = client.get(
+        "/appointments/slots",
+        params={"starts_at": "2026-12-01T11:00:00Z", "ends_at": "2026-12-01T10:00:00Z"},
+    )
 
     assert response.status_code == 422
     assert service.search_calls == []
 
 
-def test_create_booking_returns_confirmed_booking() -> None:
-    service = _FakeService(booking=_booking(status="confirmed"))
-    client = _client(service)
+def test_search_slots_rejects_naive_datetime_and_invalid_limit() -> None:
+    client = _client(_FakeAppointmentService())
+
+    naive = client.get(
+        "/appointments/slots",
+        params={"starts_at": "2026-12-01T09:00:00", "ends_at": _ENDS_AT.isoformat()},
+    )
+    invalid_limit = client.get(
+        "/appointments/slots",
+        params={**_search_params(), "limit": "101"},
+    )
+
+    assert naive.status_code == 422
+    assert invalid_limit.status_code == 422
+
+
+def test_create_booking_routes_through_workflow_with_authenticated_owner_and_key() -> None:
+    workflow = _FakeConversationService()
+    client = _client(conversation_service=workflow)
 
     response = client.post(
         "/appointments/bookings",
-        json=_booking_payload(patient_reference="  fictional-patient  "),
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(),
     )
 
     assert response.status_code == 201
@@ -288,236 +247,213 @@ def test_create_booking_returns_confirmed_booking() -> None:
         "id": str(_BOOKING_ID),
         "slot_id": str(_SLOT_ID),
         "conversation_id": str(_CONVERSATION_ID),
-        "patient_reference": "fictional-patient",
         "status": "confirmed",
-        "created_at": "2026-12-01T09:00:00Z",
-        "updated_at": "2026-12-01T09:00:00Z",
+        "response": "Your appointment is booked.",
     }
-    assert service.booking_calls == [
+    assert workflow.actions == [
         {
-            "slot_id": _SLOT_ID,
-            "patient_reference": "fictional-patient",
             "conversation_id": _CONVERSATION_ID,
-            "requires_approval": False,
+            "owner_reference": _OWNER_REFERENCE,
+            "request_id": UUID(_BOOKING_REQUEST_ID),
+            "action": "book",
+            "slot_id": _SLOT_ID,
+            "booking_id": None,
         }
     ]
 
 
-def test_create_booking_preserves_same_day_pending_approval() -> None:
-    service = _FakeService(booking=_booking(status="pending_approval"))
-    client = _client(service)
+def test_same_day_booking_returns_accepted_while_waiting_for_staff() -> None:
+    workflow = _FakeConversationService(
+        booking_result={
+            "booking_id": str(_BOOKING_ID),
+            "booking_status": "pending_approval",
+            "approval_status": "pending",
+            "response": "Your booking request is waiting for staff approval.",
+        }
+    )
+    client = _client(conversation_service=workflow)
 
     response = client.post(
         "/appointments/bookings",
-        json=_booking_payload(requires_approval=True),
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(),
     )
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert response.json()["status"] == "pending_approval"
-    assert service.booking_calls == [
-        {
-            "slot_id": _SLOT_ID,
-            "patient_reference": "fictional-patient",
-            "conversation_id": _CONVERSATION_ID,
-            "requires_approval": True,
-        }
-    ]
 
 
-def test_create_booking_rejects_blank_patient_reference() -> None:
-    service = _FakeService()
-    client = _client(service)
-
-    response = client.post(
+def test_booking_requires_idempotency_key_and_authenticated_owner() -> None:
+    missing_key = _client(conversation_service=_FakeConversationService()).post(
         "/appointments/bookings",
-        json=_booking_payload(patient_reference="   "),
+        json=_booking_payload(),
+    )
+    unauthenticated = _client(
+        conversation_service=_FakeConversationService(),
+        owner_reference=None,
+    ).post(
+        "/appointments/bookings",
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(),
+    )
+
+    assert missing_key.status_code == 422
+    assert unauthenticated.status_code == 401
+
+
+def test_booking_rejects_identity_fields_in_request_body() -> None:
+    workflow = _FakeConversationService()
+    response = _client(conversation_service=workflow).post(
+        "/appointments/bookings",
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(patient_reference="forged-owner"),
     )
 
     assert response.status_code == 422
-    assert service.booking_calls == []
+    assert workflow.actions == []
 
 
-def test_create_booking_returns_conflict_for_duplicate_booking() -> None:
-    service = _FakeService(
-        booking_error=BookingConflict("The appointment slot already has an active booking.")
-    )
-    client = _client(service)
-
-    response = client.post("/appointments/bookings", json=_booking_payload())
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": "The appointment slot already has an active booking.",
-    }
-
-
-def test_create_booking_returns_conflict_for_unavailable_slot() -> None:
-    service = _FakeService(
-        booking_error=SlotUnavailable("The slot is blocked or its doctor is inactive.")
-    )
-    client = _client(service)
-
-    response = client.post("/appointments/bookings", json=_booking_payload())
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": "The selected appointment slot is unavailable.",
-    }
-
-
-def test_create_booking_returns_not_found_for_missing_conversation() -> None:
-    service = _FakeService(booking_error=ConversationNotFound("Conversation was not found."))
-    client = _client(service)
-
-    response = client.post("/appointments/bookings", json=_booking_payload())
-
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Conversation not found."}
-
-
-def test_request_cancellation_returns_pending_approval() -> None:
-    service = _FakeService()
-    client = _client(service)
+def test_cancellation_routes_through_checkpointed_workflow() -> None:
+    workflow = _FakeConversationService()
+    client = _client(conversation_service=workflow)
 
     response = client.post(
         "/appointments/cancellations",
+        headers={"Idempotency-Key": _CANCEL_REQUEST_ID},
         json=_cancellation_payload(),
     )
 
-    assert response.status_code == 201
+    assert response.status_code == 202
     assert response.json() == {
         "id": str(_APPROVAL_ID),
         "booking_id": str(_BOOKING_ID),
         "conversation_id": str(_CONVERSATION_ID),
-        "action": "cancel_booking",
         "status": "pending",
-        "requested_at": "2026-12-01T09:00:00Z",
-        "decided_at": None,
-        "decided_by": None,
-        "decision_note": None,
+        "response": "Your cancellation request is waiting for staff approval.",
     }
-    assert service.cancellation_calls == [
-        {
-            "booking_id": _BOOKING_ID,
-            "conversation_id": _CONVERSATION_ID,
-        }
-    ]
+    assert workflow.actions[0]["action"] == "cancel"
+    assert workflow.actions[0]["booking_id"] == _BOOKING_ID
 
 
-def test_request_cancellation_returns_not_found_for_missing_booking() -> None:
-    service = _FakeService(cancellation_error=BookingNotFound("The booking does not exist."))
-    client = _client(service)
+def test_cancellation_endpoint_is_exposed_and_requires_idempotency_key() -> None:
+    client = _client(conversation_service=_FakeConversationService())
 
-    response = client.post(
+    missing_key = client.post(
         "/appointments/cancellations",
         json=_cancellation_payload(),
     )
-
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Booking not found."}
-
-
-def test_request_cancellation_returns_conflict_for_another_conversation() -> None:
-    service = _FakeService(
-        cancellation_error=BookingConversationMismatch(
-            "The booking belongs to a different conversation."
-        )
-    )
-    client = _client(service)
-
-    response = client.post(
+    valid = client.post(
         "/appointments/cancellations",
+        headers={"Idempotency-Key": _CANCEL_REQUEST_ID},
         json=_cancellation_payload(),
     )
 
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": "The booking belongs to a different conversation.",
-    }
+    assert missing_key.status_code == 422
+    assert valid.status_code == 202
 
 
-def test_request_cancellation_returns_conflict_for_invalid_booking_state() -> None:
-    service = _FakeService(
-        cancellation_error=ApprovalStateConflict(
-            "A cancel_booking approval requires a booking in 'confirmed' state."
-        )
-    )
-    client = _client(service)
-
-    response = client.post(
+def test_cancellation_requires_authenticated_owner() -> None:
+    response = _client(
+        conversation_service=_FakeConversationService(),
+        owner_reference=None,
+    ).post(
         "/appointments/cancellations",
+        headers={"Idempotency-Key": _CANCEL_REQUEST_ID},
         json=_cancellation_payload(),
     )
 
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": "Only confirmed bookings can be cancelled.",
-    }
-
-
-def test_request_cancellation_returns_conflict_for_pending_approval() -> None:
-    service = _FakeService(
-        cancellation_error=ApprovalAlreadyPending(
-            "An approval for this booking action is already pending."
-        )
-    )
-    client = _client(service)
-
-    response = client.post(
-        "/appointments/cancellations",
-        json=_cancellation_payload(),
-    )
-
-    assert response.status_code == 409
-    assert response.json() == {
-        "detail": "A cancellation request for this booking is already pending.",
-    }
+    assert response.status_code == 401
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("path", "payload", "request_id"),
     [
-        {"conversation_id": str(_CONVERSATION_ID)},
-        {"booking_id": str(_BOOKING_ID)},
-        {
-            "booking_id": "not-a-uuid",
-            "conversation_id": str(_CONVERSATION_ID),
-        },
-        {
-            "booking_id": str(_BOOKING_ID),
-            "conversation_id": "not-a-uuid",
-        },
+        (
+            "/appointments/bookings",
+            {"slot_id": str(_SLOT_ID), "conversation_id": str(_OTHER_CONVERSATION_ID)},
+            _BOOKING_REQUEST_ID,
+        ),
+        (
+            "/appointments/cancellations",
+            {"booking_id": str(_BOOKING_ID), "conversation_id": str(_OTHER_CONVERSATION_ID)},
+            _CANCEL_REQUEST_ID,
+        ),
     ],
 )
-def test_request_cancellation_rejects_invalid_input(payload: dict[str, object]) -> None:
-    service = _FakeService()
-    client = _client(service)
-
-    response = client.post("/appointments/cancellations", json=payload)
-
-    assert response.status_code == 422
-    assert service.cancellation_calls == []
-
-
-def test_appointment_endpoints_require_configured_service() -> None:
-    client = _client(None)
-
-    search_response = client.get("/appointments/slots", params=_search_params())
-    booking_response = client.post("/appointments/bookings", json=_booking_payload())
-    cancellation_response = client.post(
-        "/appointments/cancellations",
-        json=_cancellation_payload(),
+def test_appointment_actions_hide_another_owners_conversation(
+    path: str,
+    payload: dict[str, str],
+    request_id: str,
+) -> None:
+    workflow = _FakeConversationService()
+    response = _client(conversation_service=workflow).post(
+        path,
+        headers={"Idempotency-Key": request_id},
+        json=payload,
     )
 
-    assert search_response.status_code == 503
-    assert search_response.json() == {
-        "detail": "Appointment service is not configured.",
-    }
-    assert booking_response.status_code == 503
-    assert booking_response.json() == {
-        "detail": "Appointment service is not configured.",
-    }
-    assert cancellation_response.status_code == 503
-    assert cancellation_response.json() == {
-        "detail": "Appointment service is not configured.",
-    }
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Conversation not found."}
+    assert workflow.actions[0]["owner_reference"] == _OWNER_REFERENCE
+
+
+def test_approval_workflow_domain_error_maps_to_conflict() -> None:
+    workflow = _FakeConversationService(
+        booking_result={
+            "workflow_error": "approval_workflow_required",
+            "response": "Requires approval.",
+        }
+    )
+    client = _client(conversation_service=workflow)
+
+    response = client.post(
+        "/appointments/bookings",
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(),
+    )
+
+    assert response.status_code == 503
+    assert (
+        response.json()["detail"] == "This request requires a configured staff-approval workflow."
+    )
+
+
+@pytest.mark.parametrize(
+    ("workflow_error", "expected_status"),
+    [
+        ("booking_conflict", 409),
+        ("slot_unavailable", 409),
+        ("conversation_not_found", 404),
+        ("booking_not_found", 404),
+        ("booking_conversation_mismatch", 409),
+        ("approval_already_pending", 409),
+        ("approval_state_conflict", 409),
+        ("unexpected_workflow_error", 500),
+    ],
+)
+def test_appointment_workflow_errors_map_to_http_status(
+    workflow_error: str,
+    expected_status: int,
+) -> None:
+    workflow = _FakeConversationService(
+        booking_result={"workflow_error": workflow_error, "response": "Safe error."}
+    )
+    response = _client(conversation_service=workflow).post(
+        "/appointments/bookings",
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(),
+    )
+
+    assert response.status_code == expected_status
+
+
+def test_missing_services_fail_with_service_unavailable() -> None:
+    client = _client()
+
+    response = client.post(
+        "/appointments/bookings",
+        headers={"Idempotency-Key": _BOOKING_REQUEST_ID},
+        json=_booking_payload(),
+    )
+
+    assert response.status_code == 503

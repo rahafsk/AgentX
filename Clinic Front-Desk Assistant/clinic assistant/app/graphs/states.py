@@ -26,6 +26,8 @@ ApprovalStatus = Literal[
     "rejected",
 ]
 
+BookingStatus = Literal["pending_approval", "confirmed", "cancelled", "rejected"]
+
 
 class ConversationState(TypedDict):
     """State shared between conversation workflow nodes."""
@@ -47,6 +49,13 @@ class ConversationState(TypedDict):
 
     # Requested appointment slot
     requested_slot: NotRequired[str | None]
+
+    # Structured appointment request and handler results.
+    requested_booking_id: NotRequired[str | None]
+    booking_id: NotRequired[str | None]
+    booking_status: NotRequired[BookingStatus | None]
+    approval_id: NotRequired[str | None]
+    workflow_error: NotRequired[str | None]
 
     # Approval information (Member 4)
     approval_status: NotRequired[ApprovalStatus]

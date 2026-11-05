@@ -1,13 +1,12 @@
-
-#RAG helps AI find information in documents before answering a question. 
-#This code searches clinic documents, shows the answer and its source, 
+# RAG helps AI find information in documents before answering a question.
+# This code searches clinic documents, shows the answer and its source,
 # or says there is not enough information.
 
 
+from pathlib import Path
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from pathlib import Path
 
 clinic_documents = [
     {
@@ -34,6 +33,7 @@ class SharedState(TypedDict):
 
 # Node 1: retrieve relevant documents using a keyword.
 
+
 def retrieve_documents(state: SharedState) -> SharedState:
     state["documents"] = []
 
@@ -47,10 +47,9 @@ def retrieve_documents(state: SharedState) -> SharedState:
 # Node 2: simulate an LLM with fixed supported questions.
 # Unknown questions return a fallback, even if a keyword matched.
 
+
 def answer_question(state: SharedState) -> SharedState:
-    state["answer"] = (
-        "I could not find enough information in the clinic documents."
-    )
+    state["answer"] = "I could not find enough information in the clinic documents."
     state["source"] = ""
 
     for document in state["documents"]:
@@ -81,12 +80,14 @@ print(f"Graph saved to {png_path}")
 if __name__ == "__main__":
     question = input("Enter your question: ")
 
-    result = workflow.invoke({
-        "question": question,
-        "documents": [],
-        "answer": "",
-        "source": "",
-    })
+    result = workflow.invoke(
+        {
+            "question": question,
+            "documents": [],
+            "answer": "",
+            "source": "",
+        }
+    )
 
     print("Answer:", result["answer"])
 

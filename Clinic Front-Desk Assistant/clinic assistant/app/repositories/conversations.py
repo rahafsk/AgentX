@@ -20,6 +20,7 @@ def _conversation_from_row(
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         owner_reference=row["owner_reference"],
+        creation_request_id=row["creation_request_id"],
     )
 
 
@@ -33,8 +34,8 @@ class ConversationRepository:
     def __init__(self, connection: Connection[Any]) -> None:
         self._connection = connection
 
-    def create(self, owner_reference: str) -> Conversation:
-        """Create a conversation whose UUID string is also its LangGraph thread ID."""
+    def create(self, owner_reference: str, request_id: UUID) -> Conversation:
+        """Create or replay metadata for an owner's idempotent create request."""
         owner_reference = owner_reference.strip()
         if not owner_reference:
             raise ValueError("owner_reference cannot be empty.")
@@ -46,13 +47,28 @@ class ConversationRepository:
             with self._connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO conversations (id, thread_id, owner_reference)
-                    VALUES (%s, %s, %s)
-                    RETURNING id, thread_id, created_at, updated_at, owner_reference
+                    INSERT INTO conversations (
+                        id, thread_id, owner_reference, creation_request_id
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING id, thread_id, created_at, updated_at,
+                              owner_reference, creation_request_id
                     """,
-                    (conversation_id, thread_id, owner_reference),
+                    (conversation_id, thread_id, owner_reference, request_id),
                 )
                 row = cursor.fetchone()
+                if row is None:
+                    cursor.execute(
+                        """
+                        SELECT id, thread_id, created_at, updated_at,
+                               owner_reference, creation_request_id
+                        FROM conversations
+                        WHERE owner_reference = %s AND creation_request_id = %s
+                        """,
+                        (owner_reference, request_id),
+                    )
+                    row = cursor.fetchone()
 
         if row is None:
             raise RuntimeError("PostgreSQL did not return the inserted conversation.")
@@ -64,7 +80,8 @@ class ConversationRepository:
             with self._connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
-                    SELECT id, thread_id, created_at, updated_at, owner_reference
+                    SELECT id, thread_id, created_at, updated_at,
+                           owner_reference, creation_request_id
                     FROM conversations
                     WHERE id = %s
                     """,
@@ -84,7 +101,8 @@ class ConversationRepository:
             with self._connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
-                    SELECT id, thread_id, created_at, updated_at, owner_reference
+                    SELECT id, thread_id, created_at, updated_at,
+                           owner_reference, creation_request_id
                     FROM conversations
                     WHERE id = %s AND owner_reference = %s
                     """,
@@ -99,7 +117,8 @@ class ConversationRepository:
             with self._connection.cursor(row_factory=dict_row) as cursor:
                 cursor.execute(
                     """
-                    SELECT id, thread_id, created_at, updated_at, owner_reference
+                    SELECT id, thread_id, created_at, updated_at,
+                           owner_reference, creation_request_id
                     FROM conversations
                     WHERE thread_id = %s
                     """,
@@ -118,7 +137,8 @@ class ConversationRepository:
                     UPDATE conversations
                     SET updated_at = updated_at
                     WHERE id = %s
-                    RETURNING id, thread_id, created_at, updated_at, owner_reference
+                    RETURNING id, thread_id, created_at, updated_at,
+                              owner_reference, creation_request_id
                     """,
                     (conversation_id,),
                 )
@@ -139,7 +159,8 @@ class ConversationRepository:
                     UPDATE conversations
                     SET updated_at = updated_at
                     WHERE id = %s AND owner_reference = %s
-                    RETURNING id, thread_id, created_at, updated_at, owner_reference
+                    RETURNING id, thread_id, created_at, updated_at,
+                              owner_reference, creation_request_id
                     """,
                     (conversation_id, owner_reference),
                 )

@@ -39,6 +39,7 @@ python_files = ["test_*.py"]
 asyncio_mode = "auto"
 addopts = [
     "--strict-markers",
+    "--import-mode=importlib",
     "--cov=app",
     "--cov-report=term-missing",
     "--cov-fail-under=80",

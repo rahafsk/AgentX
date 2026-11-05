@@ -43,7 +43,7 @@ class AppointmentService:
         appointment_repository: AppointmentRepository,
         booking_repository: BookingRepository,
         approval_repository: ApprovalRepository,
-        conversation_repository: ConversationRepository | None = None,
+        conversation_repository: ConversationRepository,
     ) -> None:
         self._appointments = appointment_repository
         self._bookings = booking_repository
@@ -104,43 +104,43 @@ class AppointmentService:
     def book_appointment(
         self,
         slot_id: UUID,
-        patient_reference: str,
+        owner_reference: str,
         conversation_id: UUID,
         *,
-        requires_approval: bool = False,
+        approval_workflow: bool = False,
+        request_id: UUID | None = None,
     ) -> Booking:
-        """Create a booking for an open slot.
+        """Create an owner-bound booking; approval bookings require graph context.
 
         ``BookingRepository`` performs the atomic insert and automatically
-        creates a pending staff approval for same-day bookings. The returned
-        booking status therefore indicates whether approval is required.
+        creates a pending staff approval for same-day bookings only when invoked
+        from the checkpointed workflow.
         """
         slot_id = _require_uuid(slot_id, "slot_id")
         conversation_id = _require_uuid(conversation_id, "conversation_id")
+        owner_reference = _require_owner_reference(owner_reference)
+        if not isinstance(approval_workflow, bool):
+            raise TypeError("approval_workflow must be a boolean.")
+        if request_id is not None:
+            request_id = _require_uuid(request_id, "request_id")
 
-        if not isinstance(patient_reference, str):
-            raise TypeError("patient_reference must be text.")
-
-        patient_reference = patient_reference.strip()
-        if not patient_reference:
-            raise ValueError("patient_reference cannot be empty.")
-
-        if not isinstance(requires_approval, bool):
-            raise TypeError("requires_approval must be a boolean.")
-
-        self._require_conversation(conversation_id)
+        self._require_conversation(conversation_id, owner_reference)
 
         return self._bookings.create(
             slot_id,
-            patient_reference,
+            owner_reference,
             conversation_id=conversation_id,
-            requires_approval=requires_approval,
+            approval_workflow=approval_workflow,
+            request_id=request_id,
         )
 
     def request_cancellation(
         self,
         booking_id: UUID,
         conversation_id: UUID,
+        owner_reference: str,
+        *,
+        request_id: UUID | None = None,
     ) -> Approval:
         """Request staff approval to cancel a booking in its own conversation.
 
@@ -150,6 +150,10 @@ class AppointmentService:
         """
         booking_id = _require_uuid(booking_id, "booking_id")
         conversation_id = _require_uuid(conversation_id, "conversation_id")
+        owner_reference = _require_owner_reference(owner_reference)
+        if request_id is not None:
+            request_id = _require_uuid(request_id, "request_id")
+        self._require_conversation(conversation_id, owner_reference)
 
         booking = self._bookings.get(booking_id)
         if booking is None:
@@ -162,15 +166,13 @@ class AppointmentService:
             booking_id,
             conversation_id,
             "cancel_booking",
+            request_id=request_id,
         )
 
-    def _require_conversation(self, conversation_id: UUID) -> None:
-        """Validate the conversation when conversation validation is enabled."""
-        if self._conversations is None:
-            return
-
-        if self._conversations.get(conversation_id) is None:
-            raise ConversationNotFound(f"Conversation {conversation_id} was not found.")
+    def _require_conversation(self, conversation_id: UUID, owner_reference: str) -> None:
+        """Require a conversation owned by the authenticated patient reference."""
+        if self._conversations.get_for_owner(conversation_id, owner_reference) is None:
+            raise ConversationNotFound("Conversation was not found.")
 
 
 def _require_uuid(value: object, field_name: str) -> UUID:
@@ -178,6 +180,15 @@ def _require_uuid(value: object, field_name: str) -> UUID:
     if not isinstance(value, UUID):
         raise TypeError(f"{field_name} must be a UUID.")
     return value
+
+
+def _require_owner_reference(value: object) -> str:
+    """Validate an opaque owner reference received from trusted auth context."""
+    if not isinstance(value, str):
+        raise TypeError("owner_reference must be a string.")
+    if not value.strip():
+        raise ValueError("owner_reference cannot be empty.")
+    return value.strip()
 
 
 def _require_aware_datetime(value: object, field_name: str) -> datetime:

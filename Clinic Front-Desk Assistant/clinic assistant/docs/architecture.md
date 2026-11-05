@@ -43,7 +43,7 @@ Emergency detection runs before ordinary intent routing. Emergencies receive an 
 
 | Component | Responsibility |
 | --- | --- |
-| `app/main.py` | Create the FastAPI application, register routers, and expose `/health`. |
+| `app/main.py` | Create the FastAPI application, register routers, and initialize pooled PostgreSQL/checkpointer services. |
 | `app/api/` | Validate HTTP requests and responses for conversations, appointments, and staff approvals. |
 | `app/graphs/` | Define conversation state, detect and route intents, and connect workflow branches. |
 | `app/services/` | Implement conversation, appointment, approval, and clinic-knowledge behavior. |
@@ -57,6 +57,8 @@ Emergency detection runs before ordinary intent routing. Emergencies receive an 
 ## Shared contracts and persistence
 
 - **Conversation identity:** The API conversation ID must consistently identify the LangGraph thread. The graph uses that stable thread ID when saving and resuming checkpoints.
+- **Caller identity:** Conversation and appointment routes derive owner references from trusted host authentication context, never from request bodies. Staff approval routes require a separate trusted staff context. Hosts provide these resolvers when composing the application; requests fail closed when context is absent.
+- **Idempotency:** Conversation creation and message/appointment actions require UUID `Idempotency-Key` headers. Retrying a booking or approval with the same key reuses the durable result.
 - **Workflow state:** The team agrees on shared fields for recent bounded message history, intent, requested appointment slot, and approval status before connecting graph branches.
 - **Database:** PostgreSQL is the only database. Use psycopg with parameterized SQL; do not add an ORM.
 - **Appointment safety:** Booking must be atomic and database-backed. A database constraint must reject competing requests for an already-reserved slot, including simultaneous requests.
