@@ -1,4 +1,3 @@
-
 """Parameterized PostgreSQL operations for appointment slots."""
 
 from __future__ import annotations
@@ -62,9 +61,7 @@ class AppointmentRepository:
             raise ValueError("ends_at must be later than starts_at.")
 
         if not 1 <= limit <= MAX_SEARCH_LIMIT:
-            raise ValueError(
-                f"limit must be between 1 and {MAX_SEARCH_LIMIT}."
-            )
+            raise ValueError(f"limit must be between 1 and {MAX_SEARCH_LIMIT}.")
 
         query = """
             SELECT slot.id, slot.doctor_id,
@@ -96,10 +93,7 @@ class AppointmentRepository:
 
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(query, parameters)
-            return [
-                AvailableAppointmentSlot(**row)
-                for row in cursor.fetchall()
-            ]
+            return [AvailableAppointmentSlot(**row) for row in cursor.fetchall()]
 
     def get_slot(self, slot_id: UUID) -> AppointmentSlot | None:
         """Retrieve an appointment slot by ID."""
@@ -156,9 +150,7 @@ class AppointmentRepository:
             ) from exc
 
         except psycopg.errors.ForeignKeyViolation as exc:
-            raise DoctorNotFound(
-                "The selected doctor does not exist."
-            ) from exc
+            raise DoctorNotFound("The selected doctor does not exist.") from exc
 
         except psycopg.errors.CheckViolation as exc:
             raise InvalidAppointmentSlot(
@@ -166,9 +158,7 @@ class AppointmentRepository:
             ) from exc
 
         if row is None:
-            raise RuntimeError(
-                "PostgreSQL did not return the inserted appointment slot."
-            )
+            raise RuntimeError("PostgreSQL did not return the inserted appointment slot.")
 
         return _slot_from_row(row)
 
