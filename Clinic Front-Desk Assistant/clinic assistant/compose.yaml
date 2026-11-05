@@ -1,0 +1,63 @@
+name: clinic-front-desk-assistant
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:?Set POSTGRES_DB in your local .env}"
+      POSTGRES_USER: "${POSTGRES_USER:?Set POSTGRES_USER in your local .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set a local POSTGRES_PASSWORD in .env}"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: "${APP_ENV:-development}"
+      HOST: 0.0.0.0
+      PORT: "8000"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL in .env; use db as the hostname}"
+      LLM_MODE: "${LLM_MODE:-fake}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-openai-compatible}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-30}"
+      CLINIC_DOCUMENTS_PATH: /app/data/clinic_documents
+    command:
+      - sh
+      - -c
+      - python -m app.db.initialize && exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PORT:-8000}:8000"
+    volumes:
+      - ./data/clinic_documents:/app/data/clinic_documents:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
