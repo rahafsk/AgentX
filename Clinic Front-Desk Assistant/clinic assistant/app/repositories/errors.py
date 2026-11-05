@@ -1,4 +1,3 @@
-
 """Domain errors raised by PostgreSQL repository operations."""
 
 

@@ -16,6 +16,7 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 - Document the target backend architecture, request flow, data contracts, and safety requirements.
 - Add typed repository domain exceptions for doctor, conversation,
   appointment, booking, and approval operations.
+- Add DoctorRepository to retrieve doctors by ID and list active doctors.
 
 ### In progress
 
