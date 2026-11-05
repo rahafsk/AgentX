@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Annotated, Protocol, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.repositories.errors import ConversationNotFound
@@ -18,11 +18,23 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 class ConversationServiceProtocol(Protocol):
     """Service operations required by the conversation API."""
 
-    def create_conversation(self) -> Conversation: ...
+    async def create_conversation(self, owner_reference: str) -> Conversation: ...
 
-    def get_conversation(self, conversation_id: UUID) -> Conversation: ...
+    async def get_conversation(
+        self,
+        conversation_id: UUID,
+        *,
+        owner_reference: str,
+    ) -> Conversation: ...
 
-    async def process_message(self, conversation_id: UUID, message: str) -> str: ...
+    async def process_message(
+        self,
+        conversation_id: UUID,
+        message: str,
+        *,
+        owner_reference: str,
+        request_id: UUID,
+    ) -> str: ...
 
 
 class ConversationResponse(BaseModel):
@@ -79,27 +91,40 @@ ConversationServiceDependency = Annotated[
     Depends(get_conversation_service),
 ]
 
+OwnerReference = Annotated[
+    str,
+    Header(alias="X-Owner-Reference", min_length=1, max_length=200),
+]
+
+IdempotencyKey = Annotated[UUID, Header(alias="Idempotency-Key")]
+
 
 @router.post(
     "",
     response_model=ConversationResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_conversation(
+async def create_conversation(
     service: ConversationServiceDependency,
+    owner_reference: OwnerReference,
 ) -> ConversationResponse:
     """Create a conversation whose ID stays stable as the LangGraph thread ID."""
-    return ConversationResponse.from_conversation(service.create_conversation())
+    conversation = await service.create_conversation(owner_reference)
+    return ConversationResponse.from_conversation(conversation)
 
 
 @router.get("/{conversation_id}", response_model=ConversationResponse)
-def get_conversation(
+async def get_conversation(
     conversation_id: UUID,
     service: ConversationServiceDependency,
+    owner_reference: OwnerReference,
 ) -> ConversationResponse:
     """Return metadata for one conversation."""
     try:
-        conversation = service.get_conversation(conversation_id)
+        conversation = await service.get_conversation(
+            conversation_id,
+            owner_reference=owner_reference,
+        )
     except ConversationNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -113,10 +138,17 @@ async def send_message(
     conversation_id: UUID,
     payload: MessageRequest,
     service: ConversationServiceDependency,
+    owner_reference: OwnerReference,
+    request_id: IdempotencyKey,
 ) -> MessageResponse:
     """Send one patient message through the conversation workflow."""
     try:
-        response = await service.process_message(conversation_id, payload.message)
+        response = await service.process_message(
+            conversation_id,
+            payload.message,
+            owner_reference=owner_reference,
+            request_id=request_id,
+        )
     except ConversationNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
