@@ -6,6 +6,7 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 
 ### Added
 
+- Add owner-scoped conversation processing with request IDs, bounded history, approval-pending replies, and workflow timeouts.
 - Add a local Docker Compose setup for the FastAPI service and PostgreSQL, with health checks, initialization, and persistent database storage.
 - Scaffold the backend package structure for the API, LangGraph workflows, services, repositories, RAG, database, tests, and documentation.
 - Add the FastAPI application entry point and `/health` endpoint.

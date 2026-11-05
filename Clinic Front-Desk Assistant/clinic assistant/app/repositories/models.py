@@ -51,12 +51,13 @@ class AvailableAppointmentSlot:
 
 @dataclass(frozen=True, slots=True)
 class Conversation:
-    """Conversation metadata linked to its stable LangGraph thread ID."""
+    """Conversation metadata bound to an opaque owner and stable graph thread."""
 
     id: UUID
     thread_id: str
     created_at: datetime
     updated_at: datetime
+    owner_reference: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

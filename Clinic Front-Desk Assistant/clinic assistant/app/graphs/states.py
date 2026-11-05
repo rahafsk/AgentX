@@ -1,11 +1,9 @@
-
 """Shared state definitions for the clinic assistant workflow."""
 
 from typing import Annotated, Literal, NotRequired, TypedDict
 
 from langchain_core.messages import AnyMessage, RemoveMessage
 from langgraph.graph.message import add_messages
-
 
 # Maximum number of recent messages to retain.
 MAX_MESSAGES = 20
@@ -34,6 +32,9 @@ class ConversationState(TypedDict):
 
     # Shared conversation identifier
     conversation_id: str
+
+    # Stable client idempotency key for this turn; nodes should pass it to side effects.
+    request_id: NotRequired[str]
 
     # Optional minimal patient reference, if available
     patient_id: NotRequired[str | None]
@@ -65,11 +66,6 @@ def trim_messages_node(state: ConversationState) -> dict:
 
     return {
         "messages": [
-            RemoveMessage(id=message.id)
-            for message in old_messages
-            if message.id is not None
+            RemoveMessage(id=message.id) for message in old_messages if message.id is not None
         ]
     }
-
-
-

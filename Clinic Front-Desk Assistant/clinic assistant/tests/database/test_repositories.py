@@ -125,7 +125,7 @@ def test_booking_repository_maps_conflict_and_unavailable_slot(
     doctor_id = _insert_doctor(database_connection)
     start = _future_start()
     slot = appointments.create_slot(doctor_id, start, start + timedelta(minutes=30))
-    conversation = ConversationRepository(database_connection).create()
+    conversation = ConversationRepository(database_connection).create("opaque-test-owner")
 
     booking = bookings.create(slot.id, "opaque-confirmed-patient")
     assert booking.status == "confirmed"
@@ -177,12 +177,27 @@ def test_conversation_repository_keeps_id_and_thread_id_consistent(
 ) -> None:
     repository = ConversationRepository(database_connection)
 
-    conversation = repository.create()
+    conversation = repository.create("opaque-test-owner")
 
     assert conversation.thread_id == str(conversation.id)
     assert repository.get(conversation.id) == conversation
     assert repository.get_by_thread_id(conversation.thread_id) == conversation
     assert repository.get(uuid4()) is None
+
+
+def test_conversation_repository_scopes_access_to_owner(
+    database_connection: Connection[Any],
+) -> None:
+    owner_reference = f"opaque-owner-{uuid4()}"
+    another_owner = f"opaque-owner-{uuid4()}"
+    repository = ConversationRepository(database_connection)
+
+    conversation = repository.create(owner_reference)
+
+    assert conversation.owner_reference == owner_reference
+    assert repository.get_for_owner(conversation.id, owner_reference) == conversation
+    assert repository.get_for_owner(conversation.id, another_owner) is None
+    assert repository.touch_for_owner(conversation.id, another_owner) is None
 
 
 def test_approval_repository_enforces_context_and_updates_booking_atomically(
@@ -194,8 +209,8 @@ def test_approval_repository_enforces_context_and_updates_booking_atomically(
     approvals = ApprovalRepository(database_connection)
     doctor_id = _insert_doctor(database_connection)
     start = _future_start()
-    conversation = conversations.create()
-    other_conversation = conversations.create()
+    conversation = conversations.create("opaque-test-owner")
+    other_conversation = conversations.create("opaque-other-owner")
     slot = appointments.create_slot(doctor_id, start, start + timedelta(minutes=30))
     booking = bookings.create(
         slot.id,
@@ -255,7 +270,7 @@ def test_approval_repository_rejects_wrong_booking_state(
     database_connection: Connection[Any],
 ) -> None:
     doctor_id = _insert_doctor(database_connection)
-    conversation = ConversationRepository(database_connection).create()
+    conversation = ConversationRepository(database_connection).create("opaque-test-owner")
     start = _future_start()
     slot = AppointmentRepository(database_connection).create_slot(
         doctor_id, start, start + timedelta(minutes=30)
