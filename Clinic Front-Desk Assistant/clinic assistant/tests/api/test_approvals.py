@@ -2,23 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
 from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from langgraph.types import Command
 
 from app.api.approvals import router
-from app.repositories.errors import (
-    ApprovalAlreadyDecided,
-    ApprovalNotFound,
-    ApprovalStateConflict,
+from app.repositories.errors import ApprovalNotFound
+from app.repositories.models import Approval
+from app.services.approvals import (
+    ApprovalDecisionConflict,
+    ApprovalResumeTimeout,
 )
-from app.repositories.models import Approval, Conversation
 
 _APPROVAL_ID = UUID("11111111-1111-1111-1111-111111111111")
 _BOOKING_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -40,82 +37,46 @@ def _approval(*, status: str = "pending") -> Approval:
     )
 
 
-def _conversation() -> Conversation:
-    return Conversation(
-        id=_CONVERSATION_ID,
-        thread_id="thread-123",
-        created_at=_NOW,
-        updated_at=_NOW,
-        owner_reference="owner-1",
-    )
-
-
-class _ApprovalRepository:
-    def __init__(self, *, error: Exception | None = None) -> None:
+class _FakeApprovalService:
+    def __init__(
+        self,
+        *,
+        pending: list[Approval] | None = None,
+        result: tuple[Approval, str] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.pending = pending or []
+        self.result = result or (_approval(status="approved"), "The decision was applied.")
         self.error = error
-        self.calls: list[tuple[UUID, str, str, str]] = []
+        self.decisions: list[tuple[UUID, str, str, str]] = []
 
-    def list_pending(self, *, limit: int = 50) -> list[Approval]:
-        return [_approval()]
+    async def list_pending(self, *, limit: int) -> list[Approval]:
+        return self.pending[:limit]
 
-    def decide(
+    async def decide(
         self,
         approval_id: UUID,
         decision: str,
         *,
         decided_by: str,
-        decision_note: str | None = None,
-    ) -> Approval:
-        self.calls.append((approval_id, decision, decided_by, decision_note or ""))
+        decision_note: str,
+    ) -> tuple[Approval, str]:
+        self.decisions.append((approval_id, decision, decided_by, decision_note))
         if self.error is not None:
             raise self.error
-        return _approval(status=decision)
+        return self.result
 
 
-class _ConversationRepository:
-    def get(self, conversation_id: UUID) -> Conversation | None:
-        return _conversation()
-
-
-class _Workflow:
-    def __init__(self, *, error: Exception | None = None) -> None:
-        self.error = error
-        self.calls: list[tuple[Command[Any], Mapping[str, Any]]] = []
-
-    async def ainvoke(
-        self,
-        input: Command[Any],
-        config: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        self.calls.append((input, config))
-        if self.error is not None:
-            raise self.error
-        return {"response": "The decision was applied."}
-
-
-def _client(
-    *,
-    approvals: _ApprovalRepository | None = None,
-    conversations: _ConversationRepository | None = None,
-    workflow: _Workflow | None = None,
-) -> TestClient:
+def _client(service: _FakeApprovalService | None) -> TestClient:
     app = FastAPI()
     app.include_router(router)
-    if approvals is not None:
-        app.state.approval_repository = approvals
-    if conversations is not None:
-        app.state.conversation_repository = conversations
-    if workflow is not None:
-        app.state.workflow = workflow
+    if service is not None:
+        app.state.approval_service = service
     return TestClient(app)
 
 
 def test_list_pending_approvals() -> None:
-    client = _client(
-        approvals=_ApprovalRepository(),
-        conversations=_ConversationRepository(),
-        workflow=_Workflow(),
-    )
+    client = _client(_FakeApprovalService(pending=[_approval()]))
 
     response = client.get("/approvals")
 
@@ -125,13 +86,9 @@ def test_list_pending_approvals() -> None:
 
 
 @pytest.mark.parametrize("decision", ["approved", "rejected"])
-def test_decision_resumes_matching_thread(decision: str) -> None:
-    workflow = _Workflow()
-    client = _client(
-        approvals=_ApprovalRepository(),
-        conversations=_ConversationRepository(),
-        workflow=workflow,
-    )
+def test_decision_returns_resumed_response(decision: str) -> None:
+    service = _FakeApprovalService(result=(_approval(status=decision), "The decision was applied."))
+    client = _client(service)
 
     response = client.post(
         f"/approvals/{_APPROVAL_ID}/decision",
@@ -144,28 +101,22 @@ def test_decision_resumes_matching_thread(decision: str) -> None:
 
     assert response.status_code == 200
     assert response.json()["response"] == "The decision was applied."
-    command, config = workflow.calls[0]
-    assert command.resume == {"decision": decision}
-    assert config == {"configurable": {"thread_id": "thread-123"}}
+    assert service.decisions == [(_APPROVAL_ID, decision, "staff-1", "Reviewed")]
 
 
 @pytest.mark.parametrize(
     ("error", "status_code"),
     [
         (ApprovalNotFound(), 404),
-        (ApprovalAlreadyDecided(), 409),
-        (ApprovalStateConflict(), 409),
+        (ApprovalDecisionConflict(), 409),
+        (ApprovalResumeTimeout(), 504),
     ],
 )
-def test_repository_errors_are_safe(
+def test_service_errors_are_mapped_safely(
     error: Exception,
     status_code: int,
 ) -> None:
-    client = _client(
-        approvals=_ApprovalRepository(error=error),
-        conversations=_ConversationRepository(),
-        workflow=_Workflow(),
-    )
+    client = _client(_FakeApprovalService(error=error))
 
     response = client.post(
         f"/approvals/{_APPROVAL_ID}/decision",
@@ -179,12 +130,25 @@ def test_repository_errors_are_safe(
     assert response.status_code == status_code
 
 
-def test_workflow_failure_returns_500() -> None:
-    client = _client(
-        approvals=_ApprovalRepository(),
-        conversations=_ConversationRepository(),
-        workflow=_Workflow(error=RuntimeError("workflow failed")),
+def test_resume_timeout_explains_decision_was_recorded() -> None:
+    client = _client(_FakeApprovalService(error=ApprovalResumeTimeout()))
+
+    response = client.post(
+        f"/approvals/{_APPROVAL_ID}/decision",
+        json={
+            "decision": "approved",
+            "decided_by": "staff-1",
+            "decision_note": "Reviewed",
+        },
     )
+
+    assert response.status_code == 504
+    assert "decision was recorded" in response.json()["detail"]
+    assert "rolled back" not in response.json()["detail"]
+
+
+def test_workflow_failure_returns_500() -> None:
+    client = _client(_FakeApprovalService(error=RuntimeError("workflow failed")))
 
     response = client.post(
         f"/approvals/{_APPROVAL_ID}/decision",
@@ -199,11 +163,7 @@ def test_workflow_failure_returns_500() -> None:
 
 
 def test_invalid_decision_and_blank_note_are_rejected() -> None:
-    client = _client(
-        approvals=_ApprovalRepository(),
-        conversations=_ConversationRepository(),
-        workflow=_Workflow(),
-    )
+    client = _client(_FakeApprovalService())
 
     invalid_decision = client.post(
         f"/approvals/{_APPROVAL_ID}/decision",
@@ -227,6 +187,6 @@ def test_invalid_decision_and_blank_note_are_rejected() -> None:
 
 
 def test_missing_service_state_returns_503() -> None:
-    response = _client().get("/approvals")
+    response = _client(None).get("/approvals")
 
     assert response.status_code == 503

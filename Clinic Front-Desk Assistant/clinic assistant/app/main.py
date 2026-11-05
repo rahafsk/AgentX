@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, cast
@@ -24,6 +25,7 @@ from app.repositories.approvals import ApprovalRepository
 from app.repositories.bookings import BookingRepository
 from app.repositories.conversations import ConversationRepository
 from app.services.appointments import AppointmentService
+from app.services.approvals import ApprovalService, ApprovalWorkflow
 from app.services.clinic_knowledge import ClinicKnowledgeService
 from app.services.conversations import ConversationService, ConversationWorkflow
 
@@ -80,10 +82,28 @@ async def _configure_services(
     app.state.conversation_repository = conversation_repository
     app.state.appointment_service = appointment_service
     app.state.workflow = workflow
-    app.state.conversation_service = ConversationService(
+
+    conversation_service = ConversationService(
         conversation_repository,
         cast(ConversationWorkflow, workflow),
     )
+    app.state.conversation_service = conversation_service
+    app.state.approval_service = ApprovalService(
+        approval_repository,
+        conversation_repository,
+        cast(ApprovalWorkflow, workflow),
+        conversation_service,
+        resume_timeout_seconds=_resume_timeout_seconds(),
+    )
+
+
+def _resume_timeout_seconds() -> float:
+    """Read the configurable workflow resume timeout."""
+    value = os.getenv("APPROVAL_RESUME_TIMEOUT_SECONDS", "30")
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError("APPROVAL_RESUME_TIMEOUT_SECONDS must be a positive number.") from exc
 
 
 def _connect(dsn: str) -> psycopg.Connection[Any]:

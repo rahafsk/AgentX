@@ -138,6 +138,15 @@ class ConversationService:
                 if entry.users == 0:
                     self._conversation_locks.pop(conversation_id, None)
 
+    @asynccontextmanager
+    async def serialize_conversation(
+        self,
+        conversation_id: UUID,
+    ) -> AsyncIterator[None]:
+        """Serialize patient messages and staff decisions for one thread."""
+        async with self._serialize_conversation(conversation_id):
+            yield
+
     @staticmethod
     def _validate_owner_reference(owner_reference: str) -> str:
         if not isinstance(owner_reference, str) or not owner_reference.strip():

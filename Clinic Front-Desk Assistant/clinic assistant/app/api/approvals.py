@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, cast
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
-from langgraph.types import Command
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
 
 from app.repositories.errors import (
@@ -23,6 +21,11 @@ from app.repositories.models import (
     ApprovalAction,
     ApprovalDecision,
     ApprovalStatus,
+)
+from app.services.approvals import (
+    ApprovalDecisionConflict,
+    ApprovalResumeTimeout,
+    ApprovalService,
 )
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
@@ -79,24 +82,30 @@ class ApprovalDecisionResponse(BaseModel):
     response: str
 
 
-def _require_state(request: Request, name: str) -> Any:
-    value = getattr(request.app.state, name, None)
-    if value is None:
+def get_approval_service(request: Request) -> ApprovalService:
+    """Return the configured approval service from application state."""
+    service = getattr(request.app.state, "approval_service", None)
+    if service is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"{name} is not configured.",
+            detail="Approval service is not configured.",
         )
-    return value
+    return cast(ApprovalService, service)
+
+
+ApprovalServiceDependency = Annotated[
+    ApprovalService,
+    Depends(get_approval_service),
+]
 
 
 @router.get("", response_model=list[ApprovalResponse])
 async def list_pending_approvals(
-    request: Request,
+    service: ApprovalServiceDependency,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> list[ApprovalResponse]:
     """List pending staff approvals."""
-    approvals = _require_state(request, "approval_repository")
-    pending = await asyncio.to_thread(approvals.list_pending, limit=limit)
+    pending = await service.list_pending(limit=limit)
     return [ApprovalResponse.from_approval(approval) for approval in pending]
 
 
@@ -104,32 +113,15 @@ async def list_pending_approvals(
 async def decide_approval(
     approval_id: UUID,
     payload: ApprovalDecisionRequest,
-    request: Request,
+    service: ApprovalServiceDependency,
 ) -> ApprovalDecisionResponse:
     """Approve or reject a pending request and resume its workflow."""
-    approvals = _require_state(request, "approval_repository")
-    conversations = _require_state(request, "conversation_repository")
-    workflow = _require_state(request, "workflow")
-
     try:
-        approval = await asyncio.to_thread(
-            approvals.decide,
+        approval, response = await service.decide(
             approval_id,
             payload.decision,
             decided_by=payload.decided_by,
             decision_note=payload.decision_note,
-        )
-
-        conversation = await asyncio.to_thread(
-            conversations.get,
-            approval.conversation_id,
-        )
-        if conversation is None:
-            raise ConversationNotFound("Conversation was not found.")
-
-        result = await workflow.ainvoke(
-            Command(resume={"decision": approval.status}),
-            {"configurable": {"thread_id": conversation.thread_id}},
         )
     except ApprovalNotFound as exc:
         raise HTTPException(
@@ -138,6 +130,7 @@ async def decide_approval(
         ) from exc
     except (
         ApprovalAlreadyDecided,
+        ApprovalDecisionConflict,
         ApprovalStateConflict,
         ApprovalContextMismatch,
         ConversationNotFound,
@@ -146,15 +139,19 @@ async def decide_approval(
             status_code=status.HTTP_409_CONFLICT,
             detail="The approval can no longer be decided.",
         ) from exc
+    except ApprovalResumeTimeout as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=(
+                "The decision was recorded, but the workflow resume did not complete. "
+                "Retry the same decision."
+            ),
+        ) from exc
     except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="The approval decision could not be completed.",
         ) from exc
-
-    response = result.get("response")
-    if not isinstance(response, str) or not response.strip():
-        response = "The staff decision was recorded."
 
     return ApprovalDecisionResponse(
         approval=ApprovalResponse.from_approval(approval),
