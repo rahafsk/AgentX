@@ -97,6 +97,19 @@ class _CapturingLLM:
         return "The clinic opens at 9 AM."
 
 
+class _StaticRetriever:
+    def __init__(self, *chunks: RetrievedChunk) -> None:
+        self._chunks = chunks
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int = 3,
+    ) -> Sequence[RetrievedChunk]:
+        return list(self._chunks[:top_k])
+
+
 class _HugeChunkRetriever:
     def retrieve(
         self,
@@ -338,6 +351,60 @@ async def test_unsafe_excerpt_returns_fallback(tmp_path: Path) -> None:
     assert not result.grounded
     assert result.sources == ()
     assert result.answer == FALLBACK_ANSWER
+
+
+async def test_standalone_medication_instruction_excerpt_returns_fallback() -> None:
+    service = ClinicKnowledgeService(
+        retriever=_StaticRetriever(
+            RetrievedChunk(
+                text="Take ibuprofen for headaches.",
+                source="unsafe.md",
+                score=1.0,
+            )
+        ),
+    )
+
+    result = await service.answer("what are the clinic hours")
+
+    assert result.answer == FALLBACK_ANSWER
+    assert result.sources == ()
+    assert not result.grounded
+
+
+async def test_administrative_content_does_not_make_medication_instruction_safe() -> None:
+    service = ClinicKnowledgeService(
+        retriever=_StaticRetriever(
+            RetrievedChunk(
+                text="Clinic hours are 9 AM to 5 PM. Take ibuprofen for headaches.",
+                source="unsafe.md",
+                score=1.0,
+            )
+        ),
+    )
+
+    result = await service.answer("what are the clinic hours")
+
+    assert result.answer == FALLBACK_ANSWER
+    assert result.sources == ()
+    assert not result.grounded
+
+
+async def test_safe_administrative_excerpt_still_succeeds() -> None:
+    service = ClinicKnowledgeService(
+        retriever=_StaticRetriever(
+            RetrievedChunk(
+                text="Clinic hours are 9 AM to 5 PM.",
+                source="hours.md",
+                score=1.0,
+            )
+        ),
+    )
+
+    result = await service.answer("what are the clinic hours")
+
+    assert result.grounded
+    assert result.sources == ("hours.md",)
+    assert "9 AM to 5 PM" in result.answer
 
 
 @pytest.mark.parametrize(

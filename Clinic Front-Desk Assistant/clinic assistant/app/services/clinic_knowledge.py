@@ -113,6 +113,11 @@ _UNSAFE_RESPONSE = re.compile(
     r"(?:\d+(?:\.\d+)?\s*(?:mg|ml|g|tablets?|pills?|doses?)|"
     r"(?:one|two|three|four|five|six|seven|eight|nine|ten)\s*"
     r"(?:tablets?|pills?|doses?))\b"
+    r"|\b(?:take|use|give|apply)\s+"
+    r"(?:a\s+|an\s+|the\s+|some\s+)?"
+    r"(?:ibuprofen|aspirin|paracetamol|acetaminophen|painkillers?|"
+    r"antibiotics?|insulin|inhalers?|medications?|medicines?|drugs?|"
+    r"pills?|tablets?)\b"
     r"|\b(?:start|stop|increase|decrease)\s+(?:taking\s+)?"
     r"(?:your\s+|the\s+)?(?:medications?|medicines?|antibiotics?|insulin|doses?)\b"
     r"|\b(?:you|the patient|patients?)\s+(?:should|must|need to)\s+"
@@ -345,6 +350,11 @@ def _contains_unsafe_medical_advice(text: str) -> bool:
     return bool(_MEDICAL_TERMS.search(text) and _PERSONAL_ADVICE.search(text))
 
 
+def _is_safe_excerpt(text: str) -> bool:
+    """Return whether text is administrative clinic content without medical advice."""
+    return bool(_ADMIN_TOPICS.search(text)) and not _contains_unsafe_medical_advice(text)
+
+
 def _answer_is_supported(
     answer: str,
     chunks: Sequence[RetrievedChunk],
@@ -404,7 +414,7 @@ def _grounded_answer(
 
 def _excerpt_answer(chunk: RetrievedChunk) -> KnowledgeAnswer:
     """Return a safe document excerpt, or the fallback when the excerpt is unsafe."""
-    if _contains_unsafe_medical_advice(chunk.text):
+    if not _is_safe_excerpt(chunk.text):
         return _fallback_answer()
 
     excerpt = " ".join(chunk.text.split())
