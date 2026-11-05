@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Annotated, Protocol, cast
 from uuid import UUID
@@ -9,16 +10,34 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
+from app.repositories.conversations import IdempotencyKeyConflict
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import Conversation
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 
+def _create_request_hash(request: Request, body: bytes) -> str:
+    """Hash the request content so key reuse cannot change the operation."""
+    digest = hashlib.sha256()
+    digest.update(request.method.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(request.url.path.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(body)
+    return digest.hexdigest()
+
+
 class ConversationServiceProtocol(Protocol):
     """Service operations required by the conversation API."""
 
-    async def create_conversation(self, owner_reference: str) -> Conversation: ...
+    async def create_conversation(
+        self,
+        owner_reference: str,
+        *,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation: ...
 
     async def get_conversation(
         self,
@@ -105,11 +124,24 @@ IdempotencyKey = Annotated[UUID, Header(alias="Idempotency-Key")]
     status_code=status.HTTP_201_CREATED,
 )
 async def create_conversation(
+    request: Request,
     service: ConversationServiceDependency,
     owner_reference: OwnerReference,
+    idempotency_key: IdempotencyKey,
 ) -> ConversationResponse:
-    """Create a conversation whose ID stays stable as the LangGraph thread ID."""
-    conversation = await service.create_conversation(owner_reference)
+    """Create or replay a conversation for the authenticated owner."""
+    body = await request.body()
+    try:
+        conversation = await service.create_conversation(
+            owner_reference,
+            idempotency_key=str(idempotency_key),
+            request_hash=_create_request_hash(request, body),
+        )
+    except IdempotencyKeyConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Idempotency-Key was reused with different request content.",
+        ) from exc
     return ConversationResponse.from_conversation(conversation)
 
 
