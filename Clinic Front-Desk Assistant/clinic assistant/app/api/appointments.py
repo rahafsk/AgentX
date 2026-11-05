@@ -1,4 +1,4 @@
-"""HTTP endpoints for searching appointment slots and creating bookings."""
+"""HTTP endpoints for searching slots, creating bookings, and requesting cancellations."""
 
 from __future__ import annotations
 
@@ -11,16 +11,25 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.repositories.appointments import MAX_SEARCH_LIMIT
 from app.repositories.errors import (
+    ApprovalAlreadyPending,
+    ApprovalStateConflict,
     BookingConflict,
     ConversationNotFound,
     SlotUnavailable,
 )
 from app.repositories.models import (
+    Approval,
+    ApprovalAction,
+    ApprovalStatus,
     AvailableAppointmentSlot,
     Booking,
     BookingStatus,
 )
-from app.services.appointments import DEFAULT_SEARCH_LIMIT
+from app.services.appointments import (
+    DEFAULT_SEARCH_LIMIT,
+    BookingConversationMismatch,
+    BookingNotFound,
+)
 
 router = APIRouter(prefix="/appointments", tags=["appointments"])
 
@@ -45,6 +54,12 @@ class AppointmentServiceProtocol(Protocol):
         *,
         requires_approval: bool = False,
     ) -> Booking: ...
+
+    def request_cancellation(
+        self,
+        booking_id: UUID,
+        conversation_id: UUID,
+    ) -> Approval: ...
 
 
 class AvailableSlotResponse(BaseModel):
@@ -110,6 +125,42 @@ class BookingResponse(BaseModel):
             status=booking.status,
             created_at=booking.created_at,
             updated_at=booking.updated_at,
+        )
+
+
+class CancellationRequest(BaseModel):
+    """A request to cancel a confirmed booking with staff approval."""
+
+    booking_id: UUID
+    conversation_id: UUID
+
+
+class ApprovalResponse(BaseModel):
+    """A staff approval request, including its pending or decided state."""
+
+    id: UUID
+    booking_id: UUID
+    conversation_id: UUID
+    action: ApprovalAction
+    status: ApprovalStatus
+    requested_at: datetime
+    decided_at: datetime | None
+    decided_by: str | None
+    decision_note: str | None
+
+    @classmethod
+    def from_approval(cls, approval: Approval) -> ApprovalResponse:
+        """Build a response from a repository approval record."""
+        return cls(
+            id=approval.id,
+            booking_id=approval.booking_id,
+            conversation_id=approval.conversation_id,
+            action=approval.action,
+            status=approval.status,
+            requested_at=approval.requested_at,
+            decided_at=approval.decided_at,
+            decided_by=approval.decided_by,
+            decision_note=approval.decision_note,
         )
 
 
@@ -227,3 +278,47 @@ def create_booking(
         ) from exc
 
     return BookingResponse.from_booking(booking)
+
+
+@router.post(
+    "/cancellations",
+    response_model=ApprovalResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def request_cancellation(
+    payload: CancellationRequest,
+    service: AppointmentServiceDependency,
+) -> ApprovalResponse:
+    """Request staff approval to cancel a confirmed booking."""
+    try:
+        approval = service.request_cancellation(
+            payload.booking_id,
+            payload.conversation_id,
+        )
+    except BookingNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Booking not found.",
+        ) from exc
+    except BookingConversationMismatch as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The booking belongs to a different conversation.",
+        ) from exc
+    except ApprovalAlreadyPending as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A cancellation request for this booking is already pending.",
+        ) from exc
+    except ApprovalStateConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only confirmed bookings can be cancelled.",
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+    return ApprovalResponse.from_approval(approval)
