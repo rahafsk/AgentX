@@ -33,6 +33,13 @@ class ConversationStore(Protocol):
 
     def create(self, owner_reference: str) -> Conversation: ...
 
+    def create_idempotent(
+        self,
+        owner_reference: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation: ...
+
     def get_for_owner(
         self,
         conversation_id: UUID,
@@ -153,10 +160,21 @@ class ConversationService:
             raise ValueError("owner_reference cannot be empty.")
         return owner_reference.strip()
 
-    async def create_conversation(self, owner_reference: str) -> Conversation:
-        """Create conversation metadata for an authenticated opaque owner ID."""
+    async def create_conversation(
+        self,
+        owner_reference: str,
+        *,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> Conversation:
+        """Create or replay an idempotent conversation for the authenticated owner."""
         owner = self._validate_owner_reference(owner_reference)
-        return await self._repository_call(self._repository.create, owner)
+        return await self._repository_call(
+            self._repository.create_idempotent,
+            owner,
+            idempotency_key,
+            request_hash,
+        )
 
     async def get_conversation(
         self,
