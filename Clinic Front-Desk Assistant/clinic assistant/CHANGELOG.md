@@ -17,9 +17,10 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 - Add typed repository domain exceptions for doctor, conversation,
   appointment, booking, and approval operations.
 - Add DoctorRepository to retrieve doctors by ID and list active doctors.
+- Add `ClinicKnowledgeService` for grounded clinic-information answers from approved documents, including source citations, an honest no-evidence fallback, and refusal/screening of diagnosis or treatment advice.
 
 ### In progress
 
-- Conversation, appointment, and approval APIs; graph workflows; and clinic-knowledge answer generation remain in development.
+- Conversation, appointment, and approval APIs and graph workflows remain in development.
 - Full API-to-workflow integration and end-to-end deployment are still in progress.
 - No versioned release has been published yet.

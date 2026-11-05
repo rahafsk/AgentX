@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
@@ -14,7 +15,6 @@ from app.services.clinic_knowledge import (
     FALLBACK_ANSWER,
     MEDICAL_ADVICE_ANSWER,
     ClinicKnowledgeService,
-    KnowledgeRetrievalError,
 )
 
 OPENING_HOURS = "Opening hours: the clinic opens Monday to Friday, 9 AM to 6 PM."
@@ -68,6 +68,52 @@ class _NeverCalledRetriever:
         raise AssertionError("Retriever must not be called for medical advice.")
 
 
+class _ThreadRecordingRetriever:
+    def __init__(self) -> None:
+        self.thread_id: int | None = None
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int = 3,
+    ) -> Sequence[RetrievedChunk]:
+        self.thread_id = threading.get_ident()
+        return [
+            RetrievedChunk(
+                text="Opening hours are 9 AM to 5 PM.",
+                source="hours.md",
+                score=1.0,
+            )
+        ]
+
+
+class _CapturingLLM:
+    def __init__(self) -> None:
+        self.messages: list[ChatMessage] | None = None
+
+    async def complete(self, messages: Sequence[ChatMessage]) -> str:
+        self.messages = list(messages)
+        return "The clinic opens at 9 AM."
+
+
+class _HugeChunkRetriever:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int = 3,
+    ) -> Sequence[RetrievedChunk]:
+        return [
+            RetrievedChunk(
+                text="clinic opens 9 AM " + ("x" * 5_000),
+                source=f"doc-{index}.md",
+                score=1.0,
+            )
+            for index in range(top_k)
+        ]
+
+
 async def test_answer_uses_evidence_and_names_source(tmp_path: Path) -> None:
     service = _service(tmp_path)
 
@@ -105,15 +151,46 @@ async def test_non_text_question_is_rejected(tmp_path: Path) -> None:
         await service.answer(42)  # type: ignore[arg-type]
 
 
-async def test_retrieval_error_fails_safely_without_internal_details(
-    tmp_path: Path,
-) -> None:
+async def test_retrieval_error_returns_fallback(tmp_path: Path) -> None:
     service = ClinicKnowledgeService(retriever=_BrokenRetriever())
 
-    with pytest.raises(KnowledgeRetrievalError) as excinfo:
-        await service.answer("what are the opening hours")
+    result = await service.answer("what are the opening hours")
 
-    assert "/secret/clinic-profile.md" not in str(excinfo.value)
+    assert result.answer == FALLBACK_ANSWER
+    assert result.sources == ()
+    assert not result.grounded
+    assert "/secret/clinic-profile.md" not in result.answer
+
+
+async def test_oversized_question_is_rejected() -> None:
+    service = ClinicKnowledgeService(
+        retriever=_NeverCalledRetriever(),
+        llm=_NeverCalledLLM(),
+    )
+
+    with pytest.raises(ValueError, match="1000 characters or fewer"):
+        await service.answer("x" * 1001)
+
+
+async def test_retrieval_runs_outside_event_loop() -> None:
+    retriever = _ThreadRecordingRetriever()
+    service = ClinicKnowledgeService(retriever)
+
+    await service.answer("opening hours")
+
+    assert retriever.thread_id is not None
+    assert retriever.thread_id != threading.get_ident()
+
+
+async def test_llm_prompt_is_size_limited() -> None:
+    llm = _CapturingLLM()
+    service = ClinicKnowledgeService(_HugeChunkRetriever(), llm=llm)
+
+    await service.answer("opening hours", top_k=5)
+
+    assert llm.messages is not None
+    user_message = llm.messages[1]["content"]
+    assert len(user_message) < 10_000
 
 
 async def test_fake_llm_answer_keeps_source_suffix(tmp_path: Path) -> None:
@@ -186,6 +263,31 @@ async def test_medical_advice_questions_are_refused_without_retrieval_or_llm(
     assert result.answer == MEDICAL_ADVICE_ANSWER
 
 
+async def test_routine_insurance_question_reaches_retrieval(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+
+    result = await service.answer("Do I have to bring my insurance card?")
+
+    assert result.grounded
+    assert result.sources == ("insurance.txt",)
+    assert "insurance coverage" in result.answer
+    assert result.answer != MEDICAL_ADVICE_ANSWER
+
+
+async def test_routine_appointment_question_is_not_medical_refusal(
+    tmp_path: Path,
+) -> None:
+    service = _service(tmp_path)
+
+    result = await service.answer("Can I have an appointment?")
+
+    assert result.answer == FALLBACK_ANSWER
+    assert result.sources == ()
+    assert not result.grounded
+
+
 @pytest.mark.parametrize(
     "unsupported_answer",
     [
@@ -224,18 +326,121 @@ async def test_unsafe_llm_answer_uses_safe_excerpt(tmp_path: Path) -> None:
 
 async def test_unsafe_excerpt_returns_fallback(tmp_path: Path) -> None:
     (tmp_path / "unsafe.md").write_text(
-        "You should take 2 tablets of aspirin daily.",
+        "Clinic notice: You should take 2 tablets of aspirin daily.",
         encoding="utf-8",
     )
     service = ClinicKnowledgeService(
         retriever=ClinicDocumentRetriever(tmp_path),
     )
 
-    result = await service.answer("aspirin tablets daily")
+    result = await service.answer("clinic notice")
 
     assert not result.grounded
     assert result.sources == ()
     assert result.answer == FALLBACK_ANSWER
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "I have chest pain, what should I do?",
+        "Is my rash serious?",
+        "How many antibiotics should I give my child?",
+        "What can I put on a burn?",
+        "My doctor told me to double my dose, is that okay?",
+        "Could I be pregnant?",
+        "What medicine is best for a cough?",
+        "What medicine is available for my cough?",
+        "Can you provide a diagnosis?",
+        "What is my diagnosis?",
+        "Is it safe to exercise with asthma?",
+    ],
+)
+async def test_paraphrased_medical_requests_are_refused(question: str) -> None:
+    service = ClinicKnowledgeService(
+        retriever=_NeverCalledRetriever(),
+        llm=_NeverCalledLLM(),
+    )
+
+    result = await service.answer(question)
+
+    assert result.answer == MEDICAL_ADVICE_ANSWER
+    assert result.sources == ()
+    assert not result.grounded
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "Take 500 mg of paracetamol every six hours.",
+        "Apply the cream twice daily.",
+        "You may have an infection; start antibiotics.",
+        "Diagnosis: influenza.",
+        "Use this inhaler when wheezing.",
+        "Patients with asthma should carry an inhaler.",
+        "You should rest and drink fluids.",
+    ],
+)
+async def test_unsafe_excerpt_phrasings_return_fallback(
+    tmp_path: Path,
+    unsafe_text: str,
+) -> None:
+    (tmp_path / "notice.md").write_text(
+        f"Clinic notice: {unsafe_text}",
+        encoding="utf-8",
+    )
+    service = ClinicKnowledgeService(
+        retriever=ClinicDocumentRetriever(tmp_path),
+    )
+
+    result = await service.answer("clinic notice")
+
+    assert result.answer == FALLBACK_ANSWER
+    assert result.sources == ()
+    assert not result.grounded
+
+
+@pytest.mark.parametrize(
+    "unsafe_response",
+    [
+        "You may have an infection. Start antibiotics and take 500 mg.",
+        "Apply the cream twice daily.",
+        "Diagnosis: influenza. You should rest and drink fluids.",
+    ],
+)
+async def test_unsafe_model_responses_are_not_returned(
+    tmp_path: Path,
+    unsafe_response: str,
+) -> None:
+    service = _service(tmp_path, FakeLLM(unsafe_response))
+
+    result = await service.answer("what are the opening hours")
+
+    assert unsafe_response not in result.answer
+    assert "9 AM to 6 PM" in result.answer
+    assert "Source: opening_hours.md" in result.answer
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Do I have to bring my insurance card?",
+        "Can I have an appointment?",
+        "What treatment services do you offer?",
+        "What physical therapy services do you offer?",
+        "Is physical therapy covered by insurance?",
+        "Can I have a copy of my prescription?",
+    ],
+)
+async def test_routine_clinic_questions_are_not_refused(
+    tmp_path: Path,
+    question: str,
+) -> None:
+    service = _service(tmp_path)
+
+    result = await service.answer(question)
+
+    assert result.answer != MEDICAL_ADVICE_ANSWER
 
 
 async def test_llm_answer_names_only_sources_it_uses(tmp_path: Path) -> None:
@@ -251,16 +456,24 @@ async def test_llm_answer_names_only_sources_it_uses(tmp_path: Path) -> None:
     assert "Sources:" not in result.answer
 
 
-async def test_invalid_top_k_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("top_k", [0, 1000])
+async def test_invalid_answer_top_k_is_rejected(
+    tmp_path: Path,
+    top_k: int,
+) -> None:
     service = _service(tmp_path)
 
     with pytest.raises(ValueError, match="top_k"):
-        await service.answer("what are the opening hours", top_k=0)
+        await service.answer("what are the opening hours", top_k=top_k)
 
 
-def test_invalid_default_top_k_is_rejected(tmp_path: Path) -> None:
+@pytest.mark.parametrize("top_k", [0, 1000])
+def test_invalid_default_top_k_is_rejected(
+    tmp_path: Path,
+    top_k: int,
+) -> None:
     with pytest.raises(ValueError, match="top_k"):
         ClinicKnowledgeService(
             retriever=ClinicDocumentRetriever(_docs(tmp_path)),
-            top_k=0,
+            top_k=top_k,
         )

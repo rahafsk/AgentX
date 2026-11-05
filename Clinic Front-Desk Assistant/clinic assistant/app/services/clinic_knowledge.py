@@ -7,6 +7,7 @@ diagnoses conditions or recommends treatment.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -32,29 +33,107 @@ _SYSTEM_PROMPT = (
     "question, say that you do not have enough information."
 )
 
-_MEDICAL_ADVICE_REQUEST = re.compile(
-    r"\bdiagnos(?:e|is|ed|ing)\b"
-    r"|\bprescri(?:be|bed|ption)\b"
-    r"|\b(?:should|can|may|do)\s+i\s+(?:take|use|stop|start)\b"
-    r"|\b(?:what|which)\s+(?:treatment|medication|medicine|dose|dosage)\s+"
-    r"(?:should|can|do|would)\s+i\b"
-    r"|\b(?:is it safe|side effects?|symptoms?)\b"
-    r"|\b(?:do|can)\s+i\s+have\b"
-    r"|\b(?:treat|cure)\s+(?:my|me|this|a|an)\b"
-    r"|\b(?:treatment|therapy)\s+(?:for|recommendation|advice)\b"
-    r"|\b(?:recommend|suggest)\s+(?:a\s+)?(?:treatment|medication|medicine|therapy)\b",
+_MAX_TOP_K = 5
+_MAX_PROMPT_EVIDENCE_CHARS = 8_000
+_MAX_QUESTION_CHARS = 1_000
+
+_MEDICAL_TERMS = re.compile(
+    r"\b(?:"
+    r"diagnos\w*|prescri\w*|medicat\w*|medicines?|drugs?|dosage|doses?|"
+    r"tablets?|pills?|antibiotics?|insulin|inhalers?|cream|ointment|"
+    r"ibuprofen|aspirin|paracetamol|acetaminophen|painkillers?|"
+    r"symptoms?|side[-\s]?effects?|pain|fever|cough|cold|flu|covid|"
+    r"rash|itch\w*|infection|disease|illness|condition|allerg\w*|"
+    r"cancer|diabetes|pregnan\w*|depression|anxiety|asthma|migraine|"
+    r"headache|nausea|vomit\w*|dizz\w*|bleed\w*|wound|burn|injur\w*|"
+    r"fracture|sprain|swelling|swollen|lump|tumou?r|surgery|therap\w*|"
+    r"treat(?:s|ed|ing|ment|ments)?|cure|heal(?:s|ed|ing)?|"
+    r"blood pressure|heart attack|stroke|"
+    r"chest pain|breath\w*|sore throat|mental health|doctor|hospital|"
+    r"mg|ml|milligrams?|milliliters?"
+    r")\b",
     re.IGNORECASE,
 )
 
-_TREATMENT_ADVICE = re.compile(
-    r"\bdiagnos(?:e|is|ed|ing)\b"
-    r"|\bprescri(?:be|bed|ption)\b"
-    r"|\b(?:you|the patient)\s+(?:should|must|need to|can)\s+"
-    r"(?:take|use|apply|stop|start|increase|decrease)\b"
-    r"|\b(?:take|use)\s+\d+(?:\.\d+)?\s*(?:mg|ml|tablets?|pills?|doses?)\b"
+_ADMIN_TOPICS = re.compile(
+    r"\b(?:"
+    r"appointments?|book|booking|cancel|cancellation|reschedule|"
+    r"hours?|open|opening|close|closed|"
+    r"address|location|directions?|nearby|near|phone|contact|email|website|"
+    r"parking|insurance|billing|payment|cost|price|fees?|"
+    r"services?|accessibility|wheelchair|"
+    r"documents?|forms?|polic(?:y|ies)|holiday|pharmacy|refill|copy|"
+    r"records?|waiting|walk-in|staff"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_ADVICE_REQUEST = re.compile(
+    r"\bdiagnos(?:e|ed|ing)\b"
+    r"|\bprescri(?:be|bed)\b"
+    r"|\b(?:treat|cure)\s+(?:my|me|this)\b"
+    r"|\b(?:treatment|therapy)\s+for\s+(?:my|me|this)\b"
+    r"|\b(?:what|which)\s+(?:treatment|medication|medicine|dose|dosage)\s+"
+    r"(?:should|can|could|do|would)\s+(?:i|we)\b"
+    r"|\b(?:should|can|could|may|might|do|does|did)\s+(?:i|we)\s+"
+    r"(?:take|use|apply|stop|start|increase|decrease)\s+(?:taking\s+)?"
+    r"(?:a\s+|an\s+|the\s+|my\s+|your\s+|this\s+)?"
+    r"(?:medications?|medicines?|drugs?|pills?|tablets?|doses?|dosages?|"
+    r"antibiotics?|insulin|inhalers?|creams?|ointments?|supplements?|"
+    r"ibuprofen|aspirin|paracetamol|acetaminophen)\b"
+    r"|\b(?:take|use|apply|stop|start|increase|decrease)\s+"
+    r"(?:my|your|the|this)\s+(?:medications?|medicines?|drugs?|doses?|"
+    r"inhalers?|insulin|creams?|ointments?)\b"
+    r"|\b(?:side effects?|symptoms?)\b"
+    r"|\b(?:is|are)\s+(?:it|this|that|my|these|those)\b.*"
+    r"\b(?:safe|normal|serious|dangerous|contagious|urgent|infected|broken|cancer)\b"
+    r"|\b(?:how much|how many|how often)\b.*"
+    r"\b(?:take|use|give|dose|dosage|medicine|medication|tablet|pill|mg|ml)\b"
+    r"|\b(?:recommend|suggest)\b.*"
+    r"\b(?:treatment|medication|medicine|therapy|dose|doctor)\b"
+    r"|\b(?:do|can|could|should|may)\s+i\s+have\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:diagnosis|condition|disease|infection|illness|symptom|allergy|"
+    r"allergic reaction|fever|rash|pain|headache|migraine|nausea|dizziness|"
+    r"diabetes|cancer|cold|flu|covid|pregnan\w*|depression|anxiety)\b",
+    re.IGNORECASE,
+)
+
+_PERSONAL_ADVICE = re.compile(
+    r"\b(?:you|your|the patient|patients?|people)\b[^.]*\b"
+    r"(?:should|must|need to|can|may|could)\b[^.]*\b"
+    r"(?:take|use|apply|stop|start|increase|decrease|avoid|rest|exercise|"
+    r"eat|drink|carry)\b",
+    re.IGNORECASE,
+)
+
+_UNSAFE_RESPONSE = re.compile(
+    r"\bdiagnos\w*\b"
+    r"|\bprescri\w*\b"
+    r"|\b(?:take|use|apply|give)\s+"
+    r"(?:\d+(?:\.\d+)?\s*(?:mg|ml|g|tablets?|pills?|doses?)|"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten)\s*"
+    r"(?:tablets?|pills?|doses?))\b"
+    r"|\b(?:start|stop|increase|decrease)\s+(?:taking\s+)?"
+    r"(?:your\s+|the\s+)?(?:medications?|medicines?|antibiotics?|insulin|doses?)\b"
+    r"|\b(?:you|the patient|patients?)\s+(?:should|must|need to)\s+"
+    r"(?:rest|drink\s+fluids?|eat\s+light)\b"
+    r"|\b(?:you|the patient)\s+(?:may|might|could)\s+have\b"
+    r"|\b(?:you|the patient)\s+(?:have|has)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:diagnosis|condition|disease|infection|illness|symptom|allergy|"
+    r"fever|rash|pain|diabetes|cancer|cold|flu|covid|pregnan\w*)\b"
+    r"|\b(?:it|this)\s+(?:looks|seems)\s+like\b"
+    r"|\b(?:it|this)\s+(?:is|looks like|seems like)\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:infection|disease|illness|condition|cancer|flu|covid|pregnan\w*|"
+    r"migraine|rash)\b"
+    r"|\b(?:signs?|symptoms?)\s+of\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:infection|disease|illness|condition|cancer|flu|covid|pregnan\w*)\b"
+    r"|\b(?:apply|use)\s+(?:the\s+|this\s+)?"
+    r"(?:creams?|ointments?|inhalers?|injections?)\b"
+    r"|\b(?:take|use)\s+(?:this|the)\s+"
+    r"(?:medicines?|medications?|drugs?|inhalers?|creams?)\b"
     r"|\b(?:recommended|recommend|suggested|suggest)\s+"
-    r"(?:treatment|therapy|medication|medicine)\b"
-    r"|\b(?:treatment|therapy)\s+(?:for|recommendation|advice)\b",
+    r"(?:treatment|therapy|medication|medicine|dose|surgery)\b"
+    r"|\b(?:treatment|therapy)\s+for\s+(?:my|me|this|your)\b",
     re.IGNORECASE,
 )
 
@@ -122,10 +201,6 @@ class KnowledgeAnswer:
     grounded: bool
 
 
-class KnowledgeRetrievalError(RuntimeError):
-    """Raised when approved clinic documents cannot be retrieved safely."""
-
-
 class ClinicKnowledgeService:
     """Answer clinic-information questions from approved documents only."""
 
@@ -136,8 +211,8 @@ class ClinicKnowledgeService:
         llm: ChatModel | None = None,
         top_k: int = 3,
     ) -> None:
-        if top_k < 1:
-            raise ValueError("top_k must be greater than zero.")
+        if top_k < 1 or top_k > _MAX_TOP_K:
+            raise ValueError(f"top_k must be between 1 and {_MAX_TOP_K}.")
         self._retriever = retriever
         self._llm = llm
         self._top_k = top_k
@@ -152,12 +227,15 @@ class ClinicKnowledgeService:
         if not isinstance(question, str):
             raise TypeError("question must be text.")
 
+        if len(question) > _MAX_QUESTION_CHARS:
+            raise ValueError(f"question must be {_MAX_QUESTION_CHARS} characters or fewer.")
+
         normalized = question.strip()
         if not normalized:
             raise ValueError("question must not be blank.")
 
         # Refuse diagnosis/treatment requests before retrieval or model access.
-        if _MEDICAL_ADVICE_REQUEST.search(normalized):
+        if _is_medical_advice_request(normalized):
             return KnowledgeAnswer(
                 answer=MEDICAL_ADVICE_ANSWER,
                 sources=(),
@@ -165,14 +243,19 @@ class ClinicKnowledgeService:
             )
 
         resolved_top_k = self._top_k if top_k is None else top_k
-        if resolved_top_k < 1:
-            raise ValueError("top_k must be greater than zero.")
+        if resolved_top_k < 1 or resolved_top_k > _MAX_TOP_K:
+            raise ValueError(f"top_k must be between 1 and {_MAX_TOP_K}.")
 
         try:
-            chunks = self._retriever.retrieve(normalized, top_k=resolved_top_k)
-        except (DocumentLoadError, OSError) as exc:
-            raise KnowledgeRetrievalError("Could not retrieve approved clinic documents.") from exc
+            chunks = await asyncio.to_thread(
+                self._retriever.retrieve,
+                normalized,
+                top_k=resolved_top_k,
+            )
+        except (DocumentLoadError, OSError):
+            return _fallback_answer()
 
+        chunks = list(chunks)[:resolved_top_k]
         if not chunks:
             return _fallback_answer()
 
@@ -183,7 +266,7 @@ class ClinicKnowledgeService:
             # retrieved evidence. Otherwise, use a document excerpt instead.
             if (
                 llm_answer is not None
-                and not _TREATMENT_ADVICE.search(llm_answer)
+                and not _contains_unsafe_medical_advice(llm_answer)
                 and _answer_is_supported(llm_answer, chunks)
             ):
                 used_chunks = _used_chunks(llm_answer, chunks)
@@ -201,7 +284,7 @@ class ClinicKnowledgeService:
         if llm is None:
             return None
 
-        evidence = "\n\n".join(f"[{chunk.source}] {chunk.text}" for chunk in chunks)
+        evidence = _evidence_text(chunks)
         messages: list[ChatMessage] = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {
@@ -220,9 +303,46 @@ class ClinicKnowledgeService:
         return response or None
 
 
+def _evidence_text(chunks: Sequence[RetrievedChunk]) -> str:
+    """Build a prompt-size-limited evidence block."""
+    parts: list[str] = []
+    remaining = _MAX_PROMPT_EVIDENCE_CHARS
+
+    for chunk in chunks:
+        part = f"[{chunk.source}] {chunk.text}".strip()
+        if len(part) > remaining:
+            part = part[:remaining].rstrip()
+        if part:
+            parts.append(part)
+            remaining -= len(part) + 2
+        if remaining <= 0:
+            break
+
+    return "\n\n".join(parts)
+
+
 def _tokens(text: str) -> set[str]:
     """Return lowercase alphanumeric tokens without common stop words."""
     return {token for token in _TOKEN_PATTERN.findall(text.casefold()) if token not in _STOP_WORDS}
+
+
+def _is_medical_advice_request(text: str) -> bool:
+    """Return whether a request is asking for diagnosis or treatment advice."""
+    if _EXPLICIT_ADVICE_REQUEST.search(text):
+        return True
+    if not _MEDICAL_TERMS.search(text):
+        return False
+
+    # Fail closed: a medical term without a clear clinic-admin topic is treated
+    # as a medical-advice request, even if the exact wording is new.
+    return not _ADMIN_TOPICS.search(text)
+
+
+def _contains_unsafe_medical_advice(text: str) -> bool:
+    """Return whether text contains diagnosis or treatment advice."""
+    if _UNSAFE_RESPONSE.search(text):
+        return True
+    return bool(_MEDICAL_TERMS.search(text) and _PERSONAL_ADVICE.search(text))
 
 
 def _answer_is_supported(
@@ -284,7 +404,7 @@ def _grounded_answer(
 
 def _excerpt_answer(chunk: RetrievedChunk) -> KnowledgeAnswer:
     """Return a safe document excerpt, or the fallback when the excerpt is unsafe."""
-    if _TREATMENT_ADVICE.search(chunk.text):
+    if _contains_unsafe_medical_advice(chunk.text):
         return _fallback_answer()
 
     excerpt = " ".join(chunk.text.split())
@@ -299,6 +419,5 @@ __all__ = [
     "DocumentRetriever",
     "FALLBACK_ANSWER",
     "KnowledgeAnswer",
-    "KnowledgeRetrievalError",
     "MEDICAL_ADVICE_ANSWER",
 ]
