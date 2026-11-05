@@ -70,6 +70,284 @@ def test_unknown_or_empty_text_is_other(text: str) -> None:
     assert classify_intent(text) == "other"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I am having trouble breathing.",
+        "I'm struggling to breathe.",
+        "It is hard to breathe.",
+        "My child is choking.",
+        "I think my throat is closing.",
+        "My throat is swelling.",
+        "I can't catch my breath.",
+        "I am having trouble catching my breath.",
+        "I think I'm having a severe allergic reaction.",
+        "He isn't breathing.",
+        "He stopped breathing.",
+        "I am unable to breathe.",
+        "I am not able to breathe.",
+        "Breathing is difficult.",
+        "My breathing is labored.",
+        "I am short of breath.",
+        "I am bleeding heavily.",
+        "I want to kill myself.",
+        "I want to hurt myself.",
+        "I want to die.",
+    ],
+)
+def test_common_emergency_phrasings_are_detected(text: str) -> None:
+    assert classify_intent(text) == "emergency"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("I do not have chest pain.", "other"),
+        ("I'm not choking.", "other"),
+        ("No trouble breathing.", "other"),
+        ("I have no history of anaphylaxis.", "other"),
+        ("I had chest pain last week.", "other"),
+        ("I had trouble breathing yesterday.", "other"),
+        ("I have a history of anaphylaxis.", "other"),
+        ("I previously had a seizure.", "other"),
+        ("I used to have chest pain.", "other"),
+        ("I am not short of breath.", "other"),
+        ("I am not bleeding heavily.", "other"),
+        ("I stopped breathing last week.", "other"),
+        ("I don't want to die.", "other"),
+    ],
+)
+def test_negated_and_historical_emergencies_are_not_current(text: str, expected: Intent) -> None:
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "I had chest pain last week but now I can't breathe.",
+            "emergency",
+        ),
+        (
+            "I don't have chest pain, but I am choking.",
+            "emergency",
+        ),
+        (
+            "I have no chest pain and no trouble breathing.",
+            "other",
+        ),
+        (
+            "I had chest pain last week, but I feel fine now.",
+            "other",
+        ),
+        (
+            "I have chest pain since yesterday.",
+            "emergency",
+        ),
+        (
+            "I had chest pain last week and still have it.",
+            "emergency",
+        ),
+        (
+            "I had chest pain last week and I have chest pain now.",
+            "emergency",
+        ),
+        (
+            "I don't have trouble breathing, but my throat is swelling.",
+            "emergency",
+        ),
+    ],
+)
+def test_mixed_historical_and_current_emergencies(text: str, expected: Intent) -> None:
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I want to cancel my appointment because I am choking.",
+        "Can I book an appointment? I'm having trouble breathing.",
+        "What are your hours? I am having a severe allergic reaction.",
+        "I need an appointment because I can't breathe.",
+        "I need to see a doctor because I am short of breath.",
+        "I need an appointment because my throat is swelling.",
+    ],
+)
+def test_current_emergency_overrides_ordinary_appointment_keywords(text: str) -> None:
+    assert classify_intent(text) == "emergency"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What are the clinic's working hours?",
+        "What times are you open?",
+        "What is the clinic schedule?",
+        "When does the clinic open?",
+        "What time do you close?",
+        "What are your hours of operation?",
+        "What are the clinic's opening hours?",
+        "Are you open on Saturday?",
+        "I don't need to see a doctor, what is your address?",
+        "I don't want an appointment, what are your hours?",
+    ],
+)
+def test_clinic_hours_and_schedule_questions_are_not_bookings(text: str) -> None:
+    assert classify_intent(text) == "clinic_question"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("I need an appointment.", "book_appointment"),
+        ("I would like an appointment.", "book_appointment"),
+        ("I want an appointment.", "book_appointment"),
+        ("I need a doctor's appointment.", "book_appointment"),
+        ("I need to see a doctor.", "book_appointment"),
+        ("I need to find an appointment.", "find_slots"),
+        ("I don't want an appointment, do you have available slots?", "find_slots"),
+        ("I don't have chest pain but I need an appointment.", "book_appointment"),
+        ("I'd like to make an appointment.", "book_appointment"),
+        ("How do I get an appointment?", "book_appointment"),
+        ("Can I get an appointment with a doctor?", "book_appointment"),
+        ("Please schedule me for Friday.", "book_appointment"),
+        ("Can I schedule an appointment for Friday?", "book_appointment"),
+        ("I need to book an appointment with a doctor.", "book_appointment"),
+        ("I need to reschedule.", "reschedule_appointment"),
+        ("I am rescheduling my appointment.", "reschedule_appointment"),
+        ("I want to change my appointment time.", "reschedule_appointment"),
+        ("I need to move my appointment to Friday.", "reschedule_appointment"),
+        ("I need to postpone my appointment.", "reschedule_appointment"),
+        ("I need to request a cancellation.", "cancel_appointment"),
+        ("Please call off my appointment.", "cancel_appointment"),
+        ("Can I cancel my appointment?", "cancel_appointment"),
+        ("What appointment times are available?", "find_slots"),
+    ],
+)
+def test_common_appointment_phrases_are_recognized(text: str, expected: Intent) -> None:
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("I don't want to cancel my appointment.", "other"),
+        ("I do not want to cancel my appointment.", "other"),
+        ("Please don't cancel my appointment.", "other"),
+        ("I'm not cancelling my appointment.", "other"),
+        ("I am not going to cancel my appointment.", "other"),
+        ("I want to keep my appointment.", "other"),
+        (
+            "I don't want to cancel, I want to reschedule.",
+            "reschedule_appointment",
+        ),
+        (
+            "Please don't cancel my appointment; I'd like to reschedule.",
+            "reschedule_appointment",
+        ),
+        (
+            "I want to book an appointment, not cancel it.",
+            "book_appointment",
+        ),
+        (
+            "I need to reschedule my appointment, not cancel it.",
+            "reschedule_appointment",
+        ),
+    ],
+)
+def test_cancellation_refusals_do_not_trigger_cancellation(text: str, expected: Intent) -> None:
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I don't want an appointment.",
+        "I don't need an appointment.",
+        "I don't want to book an appointment.",
+        "I don't need to see a doctor.",
+    ],
+)
+def test_appointment_refusals_do_not_trigger_booking(text: str) -> None:
+    assert classify_intent(text) == "other"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "I need to cancel my appointment and book a new one.",
+            "cancel_appointment",
+        ),
+        (
+            "I want to check available slots and book an appointment.",
+            "book_appointment",
+        ),
+        (
+            "Can I reschedule my appointment to Friday afternoon?",
+            "reschedule_appointment",
+        ),
+    ],
+)
+def test_multiple_appointment_keywords_keep_priority(text: str, expected: Intent) -> None:
+    assert classify_intent(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("previous_intent", "text", "expected"),
+    [
+        ("book_appointment", "Friday afternoon", "book_appointment"),
+        ("find_slots", "next Tuesday at 3 pm", "find_slots"),
+        ("reschedule_appointment", "tomorrow morning", "reschedule_appointment"),
+        ("cancel_appointment", "Friday", "cancel_appointment"),
+        ("book_appointment", "Let's do Friday afternoon, please", "book_appointment"),
+        ("book_appointment", "the first one", "book_appointment"),
+    ],
+)
+def test_classify_intent_node_preserves_active_appointment_intent(
+    previous_intent: Intent, text: str, expected: Intent
+) -> None:
+    state = _state(HumanMessage(content=text), intent=previous_intent)
+
+    assert classify_intent_node(state) == {"intent": expected}
+
+
+@pytest.mark.parametrize(
+    ("previous_intent", "text"),
+    [
+        ("book_appointment", "Tell me a joke."),
+        ("book_appointment", "I had chest pain last week"),
+        ("book_appointment", "I have a question about Friday."),
+        ("clinic_question", "Friday afternoon"),
+        (None, "Friday afternoon"),
+    ],
+)
+def test_classify_intent_node_does_not_preserve_for_unrelated_context(
+    previous_intent: Intent | None, text: str
+) -> None:
+    state = _state(HumanMessage(content=text), intent=previous_intent)
+
+    assert classify_intent_node(state) == {"intent": "other"}
+
+
+def test_classify_intent_node_allows_new_request_to_change_intent() -> None:
+    state = _state(
+        HumanMessage(content="I need to cancel my appointment."),
+        intent="book_appointment",
+    )
+
+    assert classify_intent_node(state) == {"intent": "cancel_appointment"}
+
+
+def test_classify_intent_node_lets_emergency_override_active_appointment_intent() -> None:
+    state = _state(
+        HumanMessage(content="I can't breathe."),
+        intent="book_appointment",
+    )
+
+    assert classify_intent_node(state) == {"intent": "emergency"}
+
+
 def test_intent_destinations_cover_every_supported_intent() -> None:
     assert set(INTENT_DESTINATIONS) == set(get_args(Intent))
 

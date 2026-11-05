@@ -36,36 +36,154 @@ INTENT_DESTINATIONS: Final[dict[Intent, RouteDestination]] = {
 _EMERGENCY_PATTERN = re.compile(
     r"\b(?:"
     r"emergency|911|ambulance|unconscious|unresponsive|"
-    r"not breathing|cannot breathe|can't breathe|difficulty breathing|"
-    r"shortness of breath|chest pain|heart attack|stroke|seizure|"
-    r"severe bleeding|overdose|suicidal|anaphylaxis"
+    r"not breathing|cannot breathe|can't breathe|"
+    r"(?:isn't|aren't|wasn't|weren't)\s+breathing|stopped\s+breathing|"
+    r"unable\s+to\s+breathe|not\s+able\s+to\s+breathe|"
+    r"breathing\s+is\s+(?:difficult|hard|labored|laborious)|"
+    r"(?:trouble|difficulty|difficulties)\s+breathing|"
+    r"(?:struggling|struggle|hard|difficult)\s+to\s+breathe|"
+    r"(?:can't|cannot)\s+catch\s+(?:a|my|his|her|their)\s+breath|"
+    r"(?:trouble|difficulty|difficulties)\s+catching\s+"
+    r"(?:a|my|his|her|their)\s+breath|"
+    r"gasping|choking|"
+    r"severe\s+allergic\s+reaction(?:s)?|"
+    r"throat\s+(?:is\s+)?(?:closing|swelling)|"
+    r"shortness\s+of\s+breath|short\s+of\s+breath|"
+    r"chest\s+pain|heart\s+attack|stroke|seizure|"
+    r"severe\s+bleeding|bleeding\s+heavily|overdose|suicidal|anaphylaxis|"
+    r"kill\s+myself|hurt\s+myself|end\s+my\s+life|want\s+to\s+die"
     r")\b",
     re.IGNORECASE,
 )
 
+_CLAUSE_BOUNDARY_PATTERN = re.compile(
+    r"[.;!?,]|\b(?:but|however|yet|although|though|except)\b",
+    re.IGNORECASE,
+)
+
+_NEGATION_PATTERN = re.compile(
+    r"\b(?:no|not|never|without|deny|denies|denied|free\s+of|negative\s+for|"
+    r"isn't|aren't|wasn't|weren't|don't|doesn't|didn't|haven't|hasn't|hadn't|"
+    r"can't|cannot|won't|wouldn't|no\s+longer)\b"
+    r"(?:\s+\w+){0,5}\s*$",
+    re.IGNORECASE,
+)
+
+_HISTORICAL_PATTERN = re.compile(
+    r"\b(?:"
+    r"last\s+(?:night|week|month|year|time|summer|winter|spring|fall)|"
+    r"yesterday|the\s+day\s+before|ago|previously|in\s+the\s+past|used\s+to|"
+    r"history\s+of|resolved|no\s+longer|earlier"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_ONGOING_PATTERN = re.compile(
+    r"\b(?:now|currently|right\s+now|at\s+the\s+moment|still|since|ongoing|"
+    r"today|tonight|again)\b",
+    re.IGNORECASE,
+)
+
+_STRONG_ONGOING_PATTERN = re.compile(
+    r"\b(?:currently|right\s+now|at\s+the\s+moment|still|ongoing)\b",
+    re.IGNORECASE,
+)
+
+_IMMEDIATE_ONGOING_PATTERN = re.compile(
+    r"^\s*(?:right\s+)?(?:now|currently|still|ongoing)\b",
+    re.IGNORECASE,
+)
+
 _CANCEL_PATTERN = re.compile(
-    r"\b(?:cancel(?:ed|led|ing|ling)?|call(?:ing)? off)\b",
+    r"\b(?:"
+    r"cancel(?:led|ed|ing|ling|s)?|"
+    r"cancell?ations?|"
+    r"call(?:ed|ing)?\s+off|"
+    r"request(?:ing)?\s+(?:an?\s+|the\s+)?cancellation"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CANCEL_REFUSAL_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|will\s+not|won't|"
+    r"would\s+not|wouldn't|never|not)"
+    r"(?:\s+\w+){0,4}\s+"
+    r"(?:cancel(?:led|ed|ing|ling)?|cancellations?|call(?:ed|ing)?\s+off)|"
+    r"no\s+(?:need|intention|plans?)\s+to\s+(?:cancel|cancellations?)|"
+    r"(?:want|wish|plan|intend|need)\s+to\s+(?:keep|maintain|leave)\s+"
+    r"(?:my|the)\s+appointment"
+    r")\b",
     re.IGNORECASE,
 )
 
 _RESCHEDULE_PATTERN = re.compile(
     r"\b(?:"
-    r"re-?schedule(?:d|ing)?|"
-    r"move (?:my|the|this) appointment|"
-    r"change (?:my|the|this) appointment"
+    r"re-?schedul(?:e|ed|es|ing)|"
+    r"move\s+(?:my|the|this)\s+(?:appointment|booking)|"
+    r"change\s+(?:my|the|this)\s+(?:appointment|booking)"
+    r"(?:\s+(?:time|date|slot))?|"
+    r"(?:push|postpone)\s+(?:back\s+)?(?:my|the|this)\s+(?:appointment|booking)"
     r")\b",
     re.IGNORECASE,
 )
 
 _BOOK_PATTERN = re.compile(
-    r"\b(?:book|booking|schedule|scheduling)\b",
+    r"\b(?:"
+    r"book(?:ed|ing|s)?|"
+    r"(?:make|making|get|getting|request|requesting|arrange|arranging|set\s+up)"
+    r"\s+(?:me\s+|us\s+)?(?:an?|the|my|another)?\s*(?:appointment|booking)|"
+    r"(?:schedule|scheduling)\s+(?:me|us)\b|"
+    r"(?:schedule|scheduling)\s+(?:an?|the|my|another)\s+"
+    r"(?:appointment|booking)|"
+    r"(?:to|i'?ll|i\s+will|i\s+want\s+to|i\s+need\s+to|i'?d\s+like\s+to|"
+    r"i\s+would\s+like\s+to|can\s+i|could\s+i|please|let'?s)\s+schedule\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_APPOINTMENT_REQUEST_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:i\s+)?(?:need|want|would\s+like|i'?d\s+like)\s+"
+    r"(?:(?:an?|the|another|my)\s+)?(?:doctor'?s?\s+)?appointment|"
+    r"(?:i\s+)?(?:need|want|would\s+like|i'?d\s+like)\s+"
+    r"to\s+see\s+(?:a|the)\s+doctor"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_APPOINTMENT_REFUSAL_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|will\s+not|won't|"
+    r"would\s+not|wouldn't|never|not|can't|cannot)\s+"
+    r"(?:want|need|like|get|book|make|schedule|find)\s+"
+    r"(?:to\s+(?:book|make|get|schedule|find)\s+)?"
+    r"(?:(?:an?|the|another|my)\s+)?(?:doctor'?s?\s+)?appointment|"
+    r"(?:do\s+not|don't|does\s+not|doesn't|did\s+not|didn't|will\s+not|won't|"
+    r"would\s+not|wouldn't|never|not|can't|cannot)\s+"
+    r"(?:want|need|would\s+like)\s+to\s+see\s+(?:a|the)\s+doctor"
+    r")\b",
     re.IGNORECASE,
 )
 
 _FIND_SLOTS_PATTERN = re.compile(
     r"\b(?:"
-    r"available|availability|slots?|openings?\b(?!\s+hours?\b)|free times?|"
-    r"earliest|soonest|what times?"
+    r"available|availability|slots?|openings?\b(?!\s+hours?\b)|free\s+times?|"
+    r"earliest|soonest|find\s+(?:me\s+)?(?:an?\s+)?appointment"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CLINIC_SCHEDULE_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:clinic|opening|working|business|office|weekly|daily|your|the)\s+"
+    r"(?:hours?|schedule|timetable)|"
+    r"hours?\s+of\s+operation|"
+    r"(?:what|which)\s+times?\b[^.!?]*\b(?:open|opening|close|closing|hours?)\b|"
+    r"(?:when|what\s+time)\s+(?:do|does|are|is|will)\s+"
+    r"(?:you|the\s+clinic|the\s+office)\s+(?:open|close)|"
+    r"(?:are|is)\s+(?:you|the\s+clinic|the\s+office)\s+open|"
+    r"(?:open|opening|close|closing)\s+hours?"
     r")\b",
     re.IGNORECASE,
 )
@@ -74,9 +192,133 @@ _CLINIC_QUESTION_PATTERN = re.compile(
     r"\b(?:"
     r"hours?|open|opening|close|closing|located|location|address|phone|"
     r"parking|insurance|services?|prices?|pricing|costs?|fees?|"
-    r"polic(?:y|ies)|doctors?|providers?|treatments?|contact"
+    r"polic(?:y|ies)|doctors?|providers?|treatments?|contact|"
+    r"schedules?|timetables?"
     r")\b",
     re.IGNORECASE,
+)
+
+_APPOINTMENT_INTENTS: Final[frozenset[Intent]] = frozenset(
+    {
+        "find_slots",
+        "book_appointment",
+        "cancel_appointment",
+        "reschedule_appointment",
+    }
+)
+
+_CONTEXTUAL_FOLLOW_UP_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "a",
+        "about",
+        "actually",
+        "an",
+        "around",
+        "at",
+        "can",
+        "could",
+        "do",
+        "early",
+        "for",
+        "how",
+        "i",
+        "in",
+        "instead",
+        "it",
+        "late",
+        "let's",
+        "like",
+        "make",
+        "maybe",
+        "next",
+        "on",
+        "one",
+        "please",
+        "prefer",
+        "sounds",
+        "sure",
+        "thanks",
+        "that",
+        "the",
+        "this",
+        "we",
+        "would",
+        "works",
+        "good",
+        "fine",
+        "ok",
+        "okay",
+        "coming",
+    }
+)
+
+_CONTEXTUAL_TIME_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "mon",
+        "tue",
+        "tues",
+        "wed",
+        "thu",
+        "thur",
+        "thurs",
+        "fri",
+        "sat",
+        "sun",
+        "today",
+        "tomorrow",
+        "tonight",
+        "morning",
+        "afternoon",
+        "evening",
+        "noon",
+        "midnight",
+        "am",
+        "pm",
+        "o'clock",
+        "week",
+        "weekend",
+        "month",
+        "year",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "jan",
+        "feb",
+        "mar",
+        "apr",
+        "jun",
+        "jul",
+        "aug",
+        "sep",
+        "sept",
+        "oct",
+        "nov",
+        "dec",
+        "first",
+        "second",
+        "third",
+        "fourth",
+        "fifth",
+        "earliest",
+        "soonest",
+        "latest",
+    }
 )
 
 
@@ -84,6 +326,102 @@ def _normalized_text(text: str) -> str:
     """Normalize patient text for deterministic keyword matching."""
 
     return " ".join(text.replace("\u2019", "'").lower().split())
+
+
+def _clause_bounds(text: str, start: int, end: int) -> tuple[int, int]:
+    """Return the clause boundaries surrounding a match in normalized text."""
+
+    clause_start = 0
+    clause_end = len(text)
+
+    for boundary in _CLAUSE_BOUNDARY_PATTERN.finditer(text):
+        if boundary.end() <= start:
+            clause_start = boundary.end()
+        elif boundary.start() >= end:
+            clause_end = boundary.start()
+            break
+
+    return clause_start, clause_end
+
+
+def _is_historical_mention(clause: str, match_start: int, match_end: int) -> bool:
+    """Return whether an emergency mention is clearly historical."""
+
+    historical = _HISTORICAL_PATTERN.search(clause)
+    if historical is None:
+        return False
+
+    if _STRONG_ONGOING_PATTERN.search(clause):
+        return False
+
+    if _IMMEDIATE_ONGOING_PATTERN.search(clause[match_end:]):
+        return False
+
+    if _ONGOING_PATTERN.search(clause[:match_start]):
+        return False
+
+    if historical.start() >= match_end:
+        between = clause[match_end : historical.start()]
+        if _ONGOING_PATTERN.search(between):
+            return False
+
+    return True
+
+
+def _has_current_emergency(text: str) -> bool:
+    """Return whether the text contains an unnegated, current emergency mention."""
+
+    for match in _EMERGENCY_PATTERN.finditer(text):
+        start, end = match.span()
+        clause_start, clause_end = _clause_bounds(text, start, end)
+        prefix = text[clause_start:start]
+
+        if _NEGATION_PATTERN.search(prefix):
+            continue
+
+        clause = text[clause_start:clause_end]
+        match_start = start - clause_start
+        match_end = end - clause_start
+
+        if _is_historical_mention(clause, match_start, match_end):
+            continue
+
+        return True
+
+    return False
+
+
+def _is_numeric_contextual_token(token: str) -> bool:
+    """Return whether a token looks like a time or ordinal date."""
+
+    return (
+        re.fullmatch(r"\d{1,2}(?::\d{2})?(?:am|pm)?", token) is not None
+        or re.fullmatch(r"\d{1,2}(?:st|nd|rd|th)", token) is not None
+    )
+
+
+def _is_contextual_follow_up(text: str) -> bool:
+    """Return whether text looks like a date, time, or slot-selection reply."""
+
+    normalized = _normalized_text(text)
+    if not normalized:
+        return False
+
+    normalized = normalized.replace("a.m.", "am").replace("p.m.", "pm")
+    cleaned = re.sub(r"[^a-z0-9:']+", " ", normalized).strip()
+    tokens = cleaned.split()
+
+    if not tokens or len(tokens) > 8:
+        return False
+
+    has_time_anchor = False
+    for token in tokens:
+        if token in _CONTEXTUAL_TIME_TOKENS or _is_numeric_contextual_token(token):
+            has_time_anchor = True
+        elif token not in _CONTEXTUAL_FOLLOW_UP_TOKENS:
+            return False
+
+    return has_time_anchor
 
 
 def classify_intent(text: str) -> Intent:
@@ -98,17 +436,41 @@ def classify_intent(text: str) -> Intent:
     if not normalized:
         return "other"
 
-    if _EMERGENCY_PATTERN.search(normalized):
+    if _has_current_emergency(normalized):
         return "emergency"
-    if _CANCEL_PATTERN.search(normalized):
+
+    cancel_requested = bool(_CANCEL_PATTERN.search(normalized)) and not bool(
+        _CANCEL_REFUSAL_PATTERN.search(normalized)
+    )
+    reschedule_requested = bool(_RESCHEDULE_PATTERN.search(normalized))
+    appointment_refused = bool(_APPOINTMENT_REFUSAL_PATTERN.search(normalized))
+    book_requested = (
+        bool(_BOOK_PATTERN.search(normalized))
+        or bool(_APPOINTMENT_REQUEST_PATTERN.search(normalized))
+    ) and not appointment_refused
+    slots_requested = bool(_FIND_SLOTS_PATTERN.search(normalized))
+    has_appointment_action = (
+        cancel_requested or reschedule_requested or book_requested or slots_requested
+    )
+
+    if _CLINIC_SCHEDULE_PATTERN.search(normalized) and not has_appointment_action:
+        return "clinic_question"
+
+    if cancel_requested:
         return "cancel_appointment"
-    if _RESCHEDULE_PATTERN.search(normalized):
+    if reschedule_requested:
         return "reschedule_appointment"
-    if _BOOK_PATTERN.search(normalized):
+    if book_requested:
         return "book_appointment"
-    if _FIND_SLOTS_PATTERN.search(normalized):
+    if slots_requested:
         return "find_slots"
-    if _CLINIC_QUESTION_PATTERN.search(normalized):
+
+    # Do not let a negated doctor/appointment request leave a stray "doctor"
+    # keyword that the clinic-question fallback would otherwise match.
+    clinic_text = (
+        _APPOINTMENT_REFUSAL_PATTERN.sub(" ", normalized) if appointment_refused else normalized
+    )
+    if _CLINIC_QUESTION_PATTERN.search(clinic_text):
         return "clinic_question"
     return "other"
 
@@ -148,12 +510,22 @@ def classify_intent_node(state: ConversationState) -> dict[str, Intent]:
     """Classify the latest patient message and store the intent in graph state.
 
     Missing or empty message history is handled as ``"other"`` rather than
-    raising, so the graph can continue to its safe fallback handler.
+    raising, so the graph can continue to its safe fallback handler. When the
+    latest message is only a date, time, or slot-selection reply and an
+    appointment workflow is already active, the previous appointment intent is
+    preserved so the workflow can continue.
     """
 
     message = latest_patient_message(state.get("messages"))
     text = _message_text(message) if message is not None else ""
-    return {"intent": classify_intent(text)}
+    intent = classify_intent(text)
+
+    if intent == "other" and _is_contextual_follow_up(text):
+        previous_intent = state.get("intent")
+        if previous_intent is not None and previous_intent in _APPOINTMENT_INTENTS:
+            return {"intent": previous_intent}
+
+    return {"intent": intent}
 
 
 def route_intent(state: ConversationState) -> RouteDestination:

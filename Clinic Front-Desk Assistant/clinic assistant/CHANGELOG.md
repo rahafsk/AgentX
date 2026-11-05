@@ -17,6 +17,7 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 - Add typed repository domain exceptions for doctor, conversation,
   appointment, booking, and approval operations.
 - Add DoctorRepository to retrieve doctors by ID and list active doctors.
+- Add deterministic intent classification and safe routing for clinic questions, appointment requests, emergencies, and contextual follow-ups.
 
 ### In progress
 
