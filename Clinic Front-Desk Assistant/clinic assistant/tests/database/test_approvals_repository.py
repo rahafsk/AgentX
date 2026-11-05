@@ -3,6 +3,7 @@
 from typing import Any
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from psycopg import Connection
 
@@ -230,3 +231,73 @@ def test_invalid_booking_state(
             conversation_id,
             "cancel_booking",
         )
+
+
+def test_decision_rolls_back_on_failure(
+    database_connection: Connection[Any],
+    booking_data: tuple[UUID, UUID],
+) -> None:
+    """Undo the booking update if saving the approval decision fails."""
+    booking_id, conversation_id = booking_data
+    repository = ApprovalRepository(database_connection)
+
+    approval = repository.create(
+        booking_id,
+        conversation_id,
+        "same_day_booking",
+    )
+
+    # Force the approval update to fail after the booking is confirmed.
+    database_connection.execute(
+        """
+        CREATE FUNCTION pg_temp.fail_approval_update()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM bookings
+                WHERE id = NEW.booking_id AND status = 'confirmed'
+            ) THEN
+                RAISE EXCEPTION 'Booking was not updated first';
+            END IF;
+
+            RAISE EXCEPTION 'Forced approval update failure';
+        END;
+        $$;
+
+        CREATE TRIGGER fail_approval_update
+        BEFORE UPDATE ON approvals
+        FOR EACH ROW
+        EXECUTE FUNCTION pg_temp.fail_approval_update();
+        """,
+        prepare=False,
+    )
+
+    with pytest.raises(
+        psycopg.errors.RaiseException,
+        match="Forced approval update failure",
+    ):
+        repository.decide(
+            approval.id,
+            "approved",
+            decided_by="test-staff",
+            decision_note="Testing rollback.",
+        )
+
+    booking_row = database_connection.execute(
+        "SELECT status FROM bookings WHERE id = %s",
+        (booking_id,),
+    ).fetchone()
+
+    approval_row = database_connection.execute(
+        """
+        SELECT status, decided_at, decided_by, decision_note
+        FROM approvals
+        WHERE id = %s
+        """,
+        (approval.id,),
+    ).fetchone()
+
+    assert booking_row == ("pending_approval",)
+    assert approval_row == ("pending", None, None, None)

@@ -19,7 +19,6 @@ app/rag/retriever.py
 app/repositories/__init__.py
 app/repositories/appointments.py
 app/repositories/approvals.py
-app/repositories/approvals_repo.py
 app/repositories/bookings.py
 app/repositories/conversations.py
 app/repositories/doctors.py
