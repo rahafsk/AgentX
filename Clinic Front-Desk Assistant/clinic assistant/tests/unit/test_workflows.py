@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 from langchain_core.messages import HumanMessage
@@ -224,3 +225,58 @@ async def test_rejected_approval_resumes_with_rejected_status() -> None:
 
     assert resumed["approval_status"] == "rejected"
     assert resumed["response"]
+
+
+def test_build_workflow_requires_checkpointer_argument() -> None:
+    with pytest.raises(TypeError):
+        build_workflow(  # type: ignore[call-arg]
+            knowledge_service=_never_called_service(),
+            appointment_handler=_fail_appointment,
+        )
+
+
+def test_build_workflow_rejects_none_checkpointer() -> None:
+    with pytest.raises(ValueError, match="checkpointer is required"):
+        build_workflow(
+            knowledge_service=_never_called_service(),
+            appointment_handler=_fail_appointment,
+            checkpointer=None,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_decision",
+    [
+        None,
+        "maybe",
+        ["approved"],
+        {"decision": "approved"},
+    ],
+)
+async def test_invalid_approval_decisions_raise_value_error(
+    invalid_decision: object,
+) -> None:
+    async def appointment_handler(state: ConversationState) -> Mapping[str, Any]:
+        return {
+            "response": "Waiting for staff approval.",
+            "approval_status": "pending",
+        }
+
+    workflow = build_workflow(
+        knowledge_service=_never_called_service(),
+        appointment_handler=appointment_handler,
+        checkpointer=InMemorySaver(),
+    )
+    config = _config(f"invalid-approval-{uuid4()}")
+
+    first = await workflow.ainvoke(
+        _state("I need to cancel my appointment."),
+        config,
+    )
+    assert "__interrupt__" in first
+
+    with pytest.raises(ValueError, match="Approval decision"):
+        await workflow.ainvoke(
+            Command(resume={"decision": invalid_decision}),
+            config,
+        )

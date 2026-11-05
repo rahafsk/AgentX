@@ -44,9 +44,12 @@ def build_workflow(
     *,
     knowledge_service: ClinicKnowledgeService,
     appointment_handler: AppointmentHandler,
-    checkpointer: BaseCheckpointSaver[Any] | None = None,
+    checkpointer: BaseCheckpointSaver[Any],
 ) -> CompiledStateGraph[ConversationState, Any, ConversationState, ConversationState]:
     """Build and compile the clinic assistant workflow."""
+    if checkpointer is None:
+        raise ValueError("A checkpointer is required for approval pause/resume.")
+
     graph: StateGraph[
         ConversationState,
         None,
@@ -160,7 +163,7 @@ def _approval_status(decision: object) -> ApprovalStatus:
         raise ValueError("Approval decision must be a mapping.")
 
     value = decision.get("decision")
-    if value not in {"approved", "rejected"}:
+    if not isinstance(value, str) or value not in {"approved", "rejected"}:
         raise ValueError("Approval decision must be 'approved' or 'rejected'.")
 
     return cast(ApprovalStatus, value)
