@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
+from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -20,6 +22,9 @@ from app.graphs.routing import (
     route_intent,
 )
 from app.graphs.states import ApprovalStatus, ConversationState, trim_messages_node
+from app.repositories.bookings import BookingRepository
+from app.repositories.models import Booking
+from app.services.appointments import AppointmentService
 from app.services.clinic_knowledge import ClinicKnowledgeService
 
 APPROVAL_HANDLER = "approval_handler"
@@ -134,6 +139,90 @@ def build_workflow(
     return graph.compile(checkpointer=checkpointer)
 
 
+def make_appointment_handler(
+    appointments: AppointmentService,
+    bookings: BookingRepository,
+) -> AppointmentHandler:
+    """Adapt the appointment service to the workflow's handler contract."""
+
+    async def handle(state: ConversationState) -> Mapping[str, Any]:
+        raw_conversation_id = state.get("conversation_id")
+        if not isinstance(raw_conversation_id, str):
+            return {"response": FALLBACK_RESPONSE}
+
+        try:
+            conversation_id = UUID(raw_conversation_id)
+        except ValueError:
+            return {"response": FALLBACK_RESPONSE}
+
+        intent = state.get("intent")
+
+        if intent == "cancel_appointment":
+            booking = await _active_booking(bookings, conversation_id)
+            if booking is None:
+                return {"response": "I couldn't find an active appointment to cancel."}
+
+            await asyncio.to_thread(
+                appointments.request_cancellation,
+                booking.id,
+                conversation_id,
+            )
+            return {
+                "response": PENDING_APPROVAL_RESPONSE,
+                "approval_status": "pending",
+            }
+
+        if intent == "book_appointment":
+            slot_value = state.get("requested_slot")
+            if not isinstance(slot_value, str):
+                return {"response": "Please provide the appointment slot you want."}
+
+            try:
+                slot_id = UUID(slot_value)
+            except ValueError:
+                return {"response": "Please provide a valid appointment slot."}
+
+            patient_reference = state.get("patient_id") or str(conversation_id)
+            booking = await asyncio.to_thread(
+                appointments.book_appointment,
+                slot_id,
+                patient_reference,
+                conversation_id,
+            )
+
+            if booking.status == "pending_approval":
+                return {
+                    "response": PENDING_APPROVAL_RESPONSE,
+                    "approval_status": "pending",
+                }
+
+            return {
+                "response": "Your appointment is confirmed.",
+                "approval_status": "not_required",
+            }
+
+        if intent == "find_slots":
+            return {"response": "Please tell me the date and time you prefer."}
+
+        return {"response": FALLBACK_RESPONSE}
+
+    return handle
+
+
+async def _active_booking(
+    bookings: BookingRepository,
+    conversation_id: UUID,
+) -> Booking | None:
+    conversation_bookings = await asyncio.to_thread(
+        bookings.list_for_conversation,
+        conversation_id,
+    )
+    return next(
+        (booking for booking in conversation_bookings if booking.status == "confirmed"),
+        None,
+    )
+
+
 def _route_after_appointment(state: ConversationState) -> str:
     if state.get("approval_status") == "pending":
         return APPROVAL_HANDLER
@@ -186,4 +275,5 @@ __all__ = [
     "PENDING_APPROVAL_RESPONSE",
     "REJECTED_RESPONSE",
     "build_workflow",
+    "make_appointment_handler",
 ]
