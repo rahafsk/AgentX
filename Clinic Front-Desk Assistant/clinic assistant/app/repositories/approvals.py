@@ -92,25 +92,35 @@ class ApprovalRepository:
 
         approval_id = request_id if request_id is not None else uuid4()
 
-        with self._connection.transaction():
-            with self._connection.cursor(row_factory=dict_row) as cursor:
-                booking_row = _lock_booking(cursor, booking_id)
-
-                if booking_row["conversation_id"] != conversation_id:
-                    raise ApprovalContextMismatch(
-                        "The approval must reference the booking's conversation."
-                    )
-
-                expected_status = (
-                    "pending_approval" if action == "same_day_booking" else "confirmed"
+        if request_id is not None:
+            existing = self.get(approval_id)
+            if existing is not None:
+                return self._reuse_idempotent_approval(
+                    existing,
+                    booking_id=booking_id,
+                    conversation_id=conversation_id,
+                    action=action,
                 )
 
-                if booking_row["status"] != expected_status:
-                    raise ApprovalStateConflict(
-                        f"A {action} approval requires a booking in {expected_status!r} state."
+        try:
+            with self._connection.transaction():
+                with self._connection.cursor(row_factory=dict_row) as cursor:
+                    booking_row = _lock_booking(cursor, booking_id)
+
+                    if booking_row["conversation_id"] != conversation_id:
+                        raise ApprovalContextMismatch(
+                            "The approval must reference the booking's conversation."
+                        )
+
+                    expected_status = (
+                        "pending_approval" if action == "same_day_booking" else "confirmed"
                     )
 
-                try:
+                    if booking_row["status"] != expected_status:
+                        raise ApprovalStateConflict(
+                            f"A {action} approval requires a booking in {expected_status!r} state."
+                        )
+
                     cursor.execute(
                         """
                         INSERT INTO approvals (
@@ -129,20 +139,44 @@ class ApprovalRepository:
                     )
                     row = cursor.fetchone()
 
-                except psycopg.errors.ForeignKeyViolation as exc:
-                    raise ApprovalContextMismatch(
-                        "The approval must reference the booking's conversation."
-                    ) from exc
+                    if row is None:
+                        raise RuntimeError("PostgreSQL did not return the inserted approval.")
 
-                except psycopg.errors.UniqueViolation as exc:
-                    raise ApprovalAlreadyPending(
-                        "An approval for this booking action is already pending."
-                    ) from exc
+                    return _approval_from_row(row)
+        except psycopg.errors.ForeignKeyViolation as exc:
+            raise ApprovalContextMismatch(
+                "The approval must reference the booking's conversation."
+            ) from exc
+        except psycopg.errors.UniqueViolation as exc:
+            if request_id is not None:
+                existing = self.get(approval_id)
+                if existing is not None:
+                    return self._reuse_idempotent_approval(
+                        existing,
+                        booking_id=booking_id,
+                        conversation_id=conversation_id,
+                        action=action,
+                    )
+            raise ApprovalAlreadyPending(
+                "An approval for this booking action is already pending."
+            ) from exc
 
-                if row is None:
-                    raise RuntimeError("PostgreSQL did not return the inserted approval.")
-
-                return _approval_from_row(row)
+    @staticmethod
+    def _reuse_idempotent_approval(
+        approval: Approval,
+        *,
+        booking_id: UUID,
+        conversation_id: UUID,
+        action: ApprovalAction,
+    ) -> Approval:
+        """Return the previous result only when its key matches the same action."""
+        if (
+            approval.booking_id != booking_id
+            or approval.conversation_id != conversation_id
+            or approval.action != action
+        ):
+            raise ApprovalContextMismatch("The request ID was already used for another approval.")
+        return approval
 
     def get(self, approval_id: UUID) -> Approval | None:
         with self._connection.transaction():
@@ -241,6 +275,11 @@ class ApprovalRepository:
                     raise ApprovalContextMismatch(
                         "The approval's booking changed. Retry the request."
                     )
+
+                if approval_row["status"] == decision:
+                    # A staff client may retry after the database commit but
+                    # before the checkpointed conversation resume completed.
+                    return _approval_from_row(approval_row)
 
                 if approval_row["status"] != "pending":
                     raise ApprovalAlreadyDecided("The approval has already been decided.")

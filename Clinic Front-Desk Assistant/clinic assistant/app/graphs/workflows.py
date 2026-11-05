@@ -146,16 +146,24 @@ def _approval_node(state: ConversationState) -> dict[str, Any]:
         {
             "type": "staff_approval",
             "conversation_id": state.get("conversation_id"),
+            "approval_id": state.get("approval_id"),
+            "booking_id": state.get("booking_id"),
             "intent": state.get("intent"),
             "requested_slot": state.get("requested_slot"),
+            "requested_booking_id": state.get("requested_booking_id"),
         }
     )
 
     status = _approval_status(decision)
-    return {
+    update: dict[str, Any] = {
         "approval_status": status,
         "response": APPROVED_RESPONSE if status == "approved" else REJECTED_RESPONSE,
     }
+    if state.get("intent") == "book_appointment":
+        update["booking_status"] = "confirmed" if status == "approved" else "rejected"
+    elif state.get("intent") == "cancel_appointment":
+        update["booking_status"] = "cancelled" if status == "approved" else "confirmed"
+    return update
 
 
 def _approval_status(decision: object) -> ApprovalStatus:

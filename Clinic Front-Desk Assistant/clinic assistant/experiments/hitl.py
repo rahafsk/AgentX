@@ -1,4 +1,3 @@
-
 from typing import TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -53,17 +52,12 @@ def request_approval_node(state: SharedState) -> dict[str, str]:
 
 def emergency_response_node(state: SharedState) -> dict[str, str]:
     return {
-        "result": (
-            "If you may be experiencing an emergency, "
-            "call emergency services immediately."
-        )
+        "result": ("If you may be experiencing an emergency, call emergency services immediately.")
     }
 
 
 def other_request_node(state: SharedState) -> dict[str, str]:
-    return {
-        "result": "This request needs another workflow or clarification."
-    }
+    return {"result": "This request needs another workflow or clarification."}
 
 
 """
@@ -124,9 +118,7 @@ Running the Workflow
 def main():
     patient_message = input("Enter patient's message: ")
 
-    config = {
-        "configurable": {"thread_id": "patient-101"}
-    }
+    config = {"configurable": {"thread_id": "patient-101"}}
 
     result = workflow.invoke(
         {
@@ -153,5 +145,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

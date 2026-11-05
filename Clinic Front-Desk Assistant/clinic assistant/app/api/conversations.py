@@ -9,6 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
+from app.api.dependencies import IdempotencyKey, OwnerReferenceDependency
 from app.repositories.errors import ConversationNotFound
 from app.repositories.models import Conversation
 
@@ -18,11 +19,27 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 class ConversationServiceProtocol(Protocol):
     """Service operations required by the conversation API."""
 
-    def create_conversation(self) -> Conversation: ...
+    async def create_conversation(
+        self,
+        owner_reference: str,
+        request_id: UUID,
+    ) -> Conversation: ...
 
-    def get_conversation(self, conversation_id: UUID) -> Conversation: ...
+    async def get_conversation(
+        self,
+        conversation_id: UUID,
+        *,
+        owner_reference: str,
+    ) -> Conversation: ...
 
-    async def process_message(self, conversation_id: UUID, message: str) -> str: ...
+    async def process_message(
+        self,
+        conversation_id: UUID,
+        message: str,
+        *,
+        owner_reference: str,
+        request_id: UUID,
+    ) -> str: ...
 
 
 class ConversationResponse(BaseModel):
@@ -85,21 +102,28 @@ ConversationServiceDependency = Annotated[
     response_model=ConversationResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_conversation(
+async def create_conversation(
     service: ConversationServiceDependency,
+    owner_reference: OwnerReferenceDependency,
+    request_id: IdempotencyKey,
 ) -> ConversationResponse:
     """Create a conversation whose ID stays stable as the LangGraph thread ID."""
-    return ConversationResponse.from_conversation(service.create_conversation())
+    conversation = await service.create_conversation(owner_reference, request_id)
+    return ConversationResponse.from_conversation(conversation)
 
 
 @router.get("/{conversation_id}", response_model=ConversationResponse)
-def get_conversation(
+async def get_conversation(
     conversation_id: UUID,
     service: ConversationServiceDependency,
+    owner_reference: OwnerReferenceDependency,
 ) -> ConversationResponse:
     """Return metadata for one conversation."""
     try:
-        conversation = service.get_conversation(conversation_id)
+        conversation = await service.get_conversation(
+            conversation_id,
+            owner_reference=owner_reference,
+        )
     except ConversationNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -113,10 +137,17 @@ async def send_message(
     conversation_id: UUID,
     payload: MessageRequest,
     service: ConversationServiceDependency,
+    owner_reference: OwnerReferenceDependency,
+    request_id: IdempotencyKey,
 ) -> MessageResponse:
     """Send one patient message through the conversation workflow."""
     try:
-        response = await service.process_message(conversation_id, payload.message)
+        response = await service.process_message(
+            conversation_id,
+            payload.message,
+            owner_reference=owner_reference,
+            request_id=request_id,
+        )
     except ConversationNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -126,5 +157,10 @@ async def send_message(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="The assistant could not process the message.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
         ) from exc
     return MessageResponse(response=response)

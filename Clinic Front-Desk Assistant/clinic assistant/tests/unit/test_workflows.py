@@ -195,6 +195,9 @@ async def test_approval_requests_pause_and_resume(
 
     assert resumed["approval_status"] == "approved"
     assert resumed["response"]
+    assert resumed["booking_status"] == (
+        "cancelled" if expected_intent == "cancel_appointment" else "confirmed"
+    )
     assert calls == [expected_intent]
 
 
@@ -225,6 +228,7 @@ async def test_rejected_approval_resumes_with_rejected_status() -> None:
 
     assert resumed["approval_status"] == "rejected"
     assert resumed["response"]
+    assert resumed["booking_status"] == "confirmed"
 
 
 def test_build_workflow_requires_checkpointer_argument() -> None:

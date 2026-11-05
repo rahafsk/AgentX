@@ -56,7 +56,11 @@ class _FakeConnection:
         return _FakeTransaction()
 
 
-def _conversation_row(conversation_id: UUID) -> dict[str, object]:
+def _conversation_row(
+    conversation_id: UUID,
+    *,
+    request_id: UUID | None = None,
+) -> dict[str, object]:
     """Create a fake database row."""
 
     now = datetime.now(UTC)
@@ -67,11 +71,13 @@ def _conversation_row(conversation_id: UUID) -> dict[str, object]:
         "created_at": now,
         "updated_at": now,
         "owner_reference": "opaque-test-owner",
+        "creation_request_id": request_id,
     }
 
 
 def test_create_conversation(monkeypatch) -> None:
     conversation_id = UUID("12345678-1234-5678-1234-567812345678")
+    request_id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 
     monkeypatch.setattr(
         conversation_module,
@@ -79,19 +85,21 @@ def test_create_conversation(monkeypatch) -> None:
         lambda: conversation_id,
     )
 
-    fake_connection = _FakeConnection(_conversation_row(conversation_id))
+    fake_connection = _FakeConnection(_conversation_row(conversation_id, request_id=request_id))
     repository = ConversationRepository(fake_connection)
 
-    conversation = repository.create("opaque-test-owner")
+    conversation = repository.create("opaque-test-owner", request_id)
 
     assert conversation.id == conversation_id
     assert conversation.thread_id == str(conversation_id)
     assert conversation.owner_reference == "opaque-test-owner"
+    assert conversation.creation_request_id == request_id
     assert "INSERT INTO conversations" in fake_connection.cursor_instance.statement
     assert fake_connection.cursor_instance.parameters == (
         conversation_id,
         str(conversation_id),
         "opaque-test-owner",
+        request_id,
     )
 
 

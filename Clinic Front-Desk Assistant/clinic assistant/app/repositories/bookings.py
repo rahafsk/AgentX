@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -13,7 +13,11 @@ from psycopg.rows import dict_row
 
 from app.repositories._locks import lock_slot
 from app.repositories.approvals import ApprovalRepository
-from app.repositories.errors import BookingConflict, SlotUnavailable
+from app.repositories.errors import (
+    ApprovalWorkflowRequired,
+    BookingConflict,
+    SlotUnavailable,
+)
 from app.repositories.models import Booking, BookingStatus
 
 
@@ -48,12 +52,25 @@ class BookingRepository:
         *,
         conversation_id: UUID | None = None,
         requires_approval: bool = False,
+        approval_workflow: bool = False,
+        request_id: UUID | None = None,
     ) -> Booking:
         """Same-day bookings always require staff approval."""
         patient_reference = patient_reference.strip()
 
         if not patient_reference:
             raise ValueError("patient_reference cannot be empty.")
+
+        booking_id = request_id if request_id is not None else uuid4()
+        if request_id is not None:
+            existing = self.get(booking_id)
+            if existing is not None:
+                return self._reuse_idempotent_booking(
+                    existing,
+                    slot_id=slot_id,
+                    patient_reference=patient_reference,
+                    conversation_id=conversation_id,
+                )
 
         try:
             with self._connection.transaction():
@@ -72,6 +89,8 @@ class BookingRepository:
 
                     starts_at: datetime = slot["starts_at"]
                     now: datetime = clock["now"]
+                    if starts_at <= now:
+                        raise SlotUnavailable("The appointment slot has already started.")
 
                     same_day = (
                         starts_at.astimezone(self._timezone).date()
@@ -79,6 +98,12 @@ class BookingRepository:
                     )
 
                     needs_approval = same_day or requires_approval
+
+                    if needs_approval and not approval_workflow:
+                        raise ApprovalWorkflowRequired(
+                            "Approval-required bookings must be created through the "
+                            "checkpointed conversation workflow."
+                        )
 
                     if needs_approval and conversation_id is None:
                         raise ValueError(
@@ -90,17 +115,19 @@ class BookingRepository:
                     cursor.execute(
                         """
                         INSERT INTO bookings (
+                            id,
                             slot_id,
                             conversation_id,
                             patient_reference,
                             status
                         )
-                        VALUES (%s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s)
                         RETURNING id, slot_id, conversation_id,
                                   patient_reference, status,
                                   created_at, updated_at
                         """,
                         (
+                            booking_id,
                             slot_id,
                             conversation_id,
                             patient_reference,
@@ -128,10 +155,36 @@ class BookingRepository:
                 return booking
 
         except psycopg.errors.UniqueViolation as exc:
+            if request_id is not None:
+                existing = self.get(booking_id)
+                if existing is not None:
+                    return self._reuse_idempotent_booking(
+                        existing,
+                        slot_id=slot_id,
+                        patient_reference=patient_reference,
+                        conversation_id=conversation_id,
+                    )
             raise BookingConflict("The appointment slot already has an active booking.") from exc
 
         except psycopg.errors.CheckViolation as exc:
             raise SlotUnavailable("Bookings require an open slot and an active doctor.") from exc
+
+    @staticmethod
+    def _reuse_idempotent_booking(
+        booking: Booking,
+        *,
+        slot_id: UUID,
+        patient_reference: str,
+        conversation_id: UUID | None,
+    ) -> Booking:
+        """Return a prior result only when the key is bound to the same action."""
+        if (
+            booking.slot_id != slot_id
+            or booking.patient_reference != patient_reference
+            or booking.conversation_id != conversation_id
+        ):
+            raise BookingConflict("The Idempotency-Key was already used for another booking.")
+        return booking
 
     def get(self, booking_id: UUID) -> Booking | None:
         with self._connection.transaction():

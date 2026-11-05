@@ -10,9 +10,10 @@ from uuid import UUID
 
 import pytest
 from langchain_core.messages import HumanMessage, RemoveMessage
+from langgraph.types import Command
 
 from app.graphs.states import MAX_MESSAGES
-from app.repositories.errors import ConversationNotFound
+from app.repositories.errors import ApprovalNotFound, ConversationNotFound
 from app.repositories.models import Conversation
 from app.services.conversations import (
     ConversationProcessingError,
@@ -37,12 +38,20 @@ def _conversation(owner_reference: str = _OWNER) -> Conversation:
 class _FakeRepository:
     def __init__(self, conversations: list[Conversation] | None = None) -> None:
         self._conversations = {item.id: item for item in conversations or []}
-        self.created_owners: list[str] = []
+        self.created_owners: list[tuple[str, UUID]] = []
         self.touched: list[tuple[UUID, str]] = []
 
-    def create(self, owner_reference: str) -> Conversation:
-        self.created_owners.append(owner_reference)
+    def create(self, owner_reference: str, request_id: UUID) -> Conversation:
+        self.created_owners.append((owner_reference, request_id))
         conversation = _conversation(owner_reference)
+        conversation = Conversation(
+            id=conversation.id,
+            thread_id=conversation.thread_id,
+            created_at=conversation.created_at,
+            updated_at=conversation.updated_at,
+            owner_reference=conversation.owner_reference,
+            creation_request_id=request_id,
+        )
         self._conversations[conversation.id] = conversation
         return conversation
 
@@ -56,6 +65,9 @@ class _FakeRepository:
             return None
         return conversation
 
+    def get(self, conversation_id: UUID) -> Conversation | None:
+        return self._conversations.get(conversation_id)
+
     def touch_for_owner(
         self,
         conversation_id: UUID,
@@ -68,8 +80,9 @@ class _FakeRepository:
 
 
 class _Snapshot:
-    def __init__(self, values: Mapping[str, Any]) -> None:
+    def __init__(self, values: Mapping[str, Any], next_nodes: tuple[str, ...] = ()) -> None:
         self.values = values
+        self.next = next_nodes
 
 
 class _FakeWorkflow:
@@ -79,11 +92,13 @@ class _FakeWorkflow:
         *,
         delay_seconds: float = 0,
         state: dict[str, Any] | None = None,
+        next_nodes: tuple[str, ...] = (),
     ) -> None:
         self.result = result if result is not None else {"response": "We can help."}
         self.delay_seconds = delay_seconds
         self.state = dict(state or {})
-        self.inputs: list[dict[str, Any]] = []
+        self.next_nodes = next_nodes
+        self.inputs: list[Any] = []
         self.configs: list[dict[str, Any] | None] = []
         self.read_configs: list[dict[str, Any]] = []
         self.active_calls = 0
@@ -91,11 +106,11 @@ class _FakeWorkflow:
 
     async def aget_state(self, config: Mapping[str, Any]) -> _Snapshot:
         self.read_configs.append(dict(config))
-        return _Snapshot(dict(self.state))
+        return _Snapshot(dict(self.state), self.next_nodes)
 
     async def ainvoke(
         self,
-        input: dict[str, Any],
+        input: Any,
         config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.active_calls += 1
@@ -105,6 +120,11 @@ class _FakeWorkflow:
         try:
             if self.delay_seconds:
                 await asyncio.sleep(self.delay_seconds)
+
+            if isinstance(input, Command):
+                self.state.update(self.result)
+                self.next_nodes = ()
+                return dict(self.state)
 
             messages = list(self.state.get("messages", []))
             for update in input.get("messages", []):
@@ -131,18 +151,25 @@ class _FakeWorkflow:
 def test_create_conversation_binds_authenticated_owner() -> None:
     repository = _FakeRepository()
     service = ConversationService(repository, _FakeWorkflow())
+    request_id = UUID("99999999-9999-4999-8999-999999999999")
 
-    conversation = asyncio.run(service.create_conversation(_OWNER))
+    conversation = asyncio.run(service.create_conversation(_OWNER, request_id))
 
     assert conversation.owner_reference == _OWNER
-    assert repository.created_owners == [_OWNER]
+    assert conversation.creation_request_id == request_id
+    assert repository.created_owners == [(_OWNER, request_id)]
 
 
 def test_create_conversation_rejects_empty_owner() -> None:
     service = ConversationService(_FakeRepository(), _FakeWorkflow())
 
     with pytest.raises(ValueError, match="owner_reference"):
-        asyncio.run(service.create_conversation("  "))
+        asyncio.run(
+            service.create_conversation(
+                "  ",
+                UUID("99999999-9999-4999-8999-999999999999"),
+            )
+        )
 
 
 def test_get_conversation_checks_owner_without_leaking_existence() -> None:
@@ -269,6 +296,59 @@ def test_checkpointed_history_is_trimmed_to_configured_limit() -> None:
     assert workflow.inputs[0]["approval_status"] == "not_required"
 
 
+def test_new_turn_clears_stale_structured_appointment_state() -> None:
+    conversation = _conversation()
+    workflow = _FakeWorkflow(
+        {"response": "Choose an available slot."},
+        state={
+            "requested_slot": "11111111-1111-4111-8111-111111111111",
+            "requested_booking_id": "22222222-2222-4222-8222-222222222222",
+            "booking_id": "33333333-3333-4333-8333-333333333333",
+            "booking_status": "pending_approval",
+            "approval_id": "44444444-4444-4444-8444-444444444444",
+            "workflow_error": "old_error",
+        },
+    )
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+
+    asyncio.run(
+        service.process_message(
+            conversation.id,
+            "I have a question about clinic hours.",
+            owner_reference=_OWNER,
+            request_id=UUID("12121212-1212-4121-8121-121212121212"),
+        )
+    )
+
+    assert workflow.inputs[0]["requested_slot"] is None
+    assert workflow.inputs[0]["requested_booking_id"] is None
+    assert workflow.inputs[0]["booking_id"] is None
+    assert workflow.inputs[0]["booking_status"] is None
+    assert workflow.inputs[0]["approval_id"] is None
+    assert workflow.inputs[0]["workflow_error"] is None
+
+
+def test_new_turn_is_blocked_while_a_staff_approval_is_pending() -> None:
+    conversation = _conversation()
+    workflow = _FakeWorkflow(
+        state={"approval_status": "pending"},
+        next_nodes=("approval_handler",),
+    )
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+
+    with pytest.raises(ConversationProcessingError, match="waiting for a staff approval"):
+        asyncio.run(
+            service.process_message(
+                conversation.id,
+                "Another message",
+                owner_reference=_OWNER,
+                request_id=UUID("13131313-1313-4131-8131-131313131313"),
+            )
+        )
+
+    assert workflow.inputs == []
+
+
 def test_approval_pause_returns_pending_response_when_workflow_has_no_text() -> None:
     conversation = _conversation()
     workflow = _FakeWorkflow({"approval_status": "pending", "response": ""})
@@ -284,6 +364,54 @@ def test_approval_pause_returns_pending_response_when_workflow_has_no_text() -> 
     )
 
     assert "waiting for staff review" in response
+
+
+def test_staff_decision_resumes_only_the_matching_paused_conversation() -> None:
+    approval_id = UUID("44444444-4444-4444-8444-444444444444")
+    conversation = _conversation()
+    workflow = _FakeWorkflow(
+        {
+            "approval_id": str(approval_id),
+            "approval_status": "approved",
+            "booking_status": "confirmed",
+            "response": "Clinic staff approved your request.",
+        },
+        state={
+            "approval_id": str(approval_id),
+            "approval_status": "pending",
+        },
+        next_nodes=("approval_handler",),
+    )
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+
+    result = asyncio.run(service.resume_approval(conversation.id, approval_id, "approved"))
+
+    assert result["approval_status"] == "approved"
+    assert result["booking_status"] == "confirmed"
+    assert isinstance(workflow.inputs[0], Command)
+    assert workflow.configs == [
+        {"configurable": {"thread_id": conversation.thread_id}},
+    ]
+
+
+def test_staff_decision_cannot_resume_a_different_approval() -> None:
+    conversation = _conversation()
+    workflow = _FakeWorkflow(
+        state={"approval_id": "55555555-5555-4555-8555-555555555555", "approval_status": "pending"},
+        next_nodes=("approval_handler",),
+    )
+    service = ConversationService(_FakeRepository([conversation]), workflow)
+
+    with pytest.raises(ApprovalNotFound):
+        asyncio.run(
+            service.resume_approval(
+                conversation.id,
+                UUID("44444444-4444-4444-8444-444444444444"),
+                "approved",
+            )
+        )
+
+    assert workflow.inputs == []
 
 
 def test_process_message_rejects_empty_and_oversized_messages() -> None:

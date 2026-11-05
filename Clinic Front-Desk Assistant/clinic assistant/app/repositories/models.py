@@ -58,6 +58,7 @@ class Conversation:
     created_at: datetime
     updated_at: datetime
     owner_reference: str | None = None
+    creation_request_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
