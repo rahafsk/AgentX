@@ -8,6 +8,7 @@ app/api/__init__.py
 app/api/appointments.py
 app/api/approvals.py
 app/api/conversations.py
+app/api/dependencies.py
 app/db/__init__.py
 app/db/initialize.py
 app/graphs/__init__.py
@@ -17,9 +18,9 @@ app/graphs/workflows.py
 app/rag/__init__.py
 app/rag/retriever.py
 app/repositories/__init__.py
+app/repositories/_locks.py
 app/repositories/appointments.py
 app/repositories/approvals.py
-app/repositories/approvals_repo.py
 app/repositories/bookings.py
 app/repositories/conversations.py
 app/repositories/doctors.py
@@ -27,6 +28,7 @@ app/repositories/errors.py
 app/repositories/models.py
 app/services/__init__.py
 app/services/appointments.py
+app/services/approvals.py
 app/services/clinic_knowledge.py
 app/services/conversations.py
 clinic_front_desk_assistant.egg-info/PKG-INFO
