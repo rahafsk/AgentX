@@ -207,8 +207,10 @@ def test_approval_repository_enforces_context_and_updates_booking_atomically(
     with pytest.raises(ApprovalContextMismatch):
         approvals.create(booking.id, other_conversation.id, "same_day_booking")
 
-    approval = approvals.create(booking.id, conversation.id, "same_day_booking")
-    assert approval.id in {item.id for item in approvals.list_pending()}
+    approval = approvals.get(booking.id)
+    assert approval is not None
+    assert approval.booking_id == booking.id
+    assert approval.status == "pending"
 
     with pytest.raises(ApprovalAlreadyPending):
         approvals.create(booking.id, conversation.id, "same_day_booking")
@@ -221,12 +223,32 @@ def test_approval_repository_enforces_context_and_updates_booking_atomically(
     )
 
     assert decided.status == "approved"
-    assert bookings.get(booking.id).status == "confirmed"
-    assert approvals.list_pending() == []
+
+    saved_booking = bookings.get(booking.id)
+    assert saved_booking is not None
+    assert saved_booking.status == "confirmed"
+
+    saved_approval = approvals.get(approval.id)
+    assert saved_approval is not None
+    assert saved_approval.status == "approved"
+    assert saved_approval.decided_by == "test-front-desk"
+    assert saved_approval.decided_at is not None
+
     with pytest.raises(ApprovalAlreadyDecided):
-        approvals.decide(approval.id, "rejected", decided_by="test-front-desk")
+        approvals.decide(
+            approval.id,
+            "rejected",
+            decided_by="test-front-desk",
+            decision_note="Checking a repeated decision.",
+        )
+
     with pytest.raises(ApprovalNotFound):
-        approvals.decide(uuid4(), "approved", decided_by="test-front-desk")
+        approvals.decide(
+            uuid4(),
+            "approved",
+            decided_by="test-front-desk",
+            decision_note="Checking an unknown approval.",
+        )
 
 
 def test_approval_repository_rejects_wrong_booking_state(
