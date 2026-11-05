@@ -15,7 +15,15 @@ app/graphs/routing.py
 app/graphs/states.py
 app/graphs/workflows.py
 app/rag/__init__.py
+app/rag/retriever.py
 app/repositories/__init__.py
+app/repositories/appointments.py
+app/repositories/approvals.py
+app/repositories/bookings.py
+app/repositories/conversations.py
+app/repositories/doctors.py
+app/repositories/errors.py
+app/repositories/models.py
 app/services/__init__.py
 app/services/appointments.py
 app/services/clinic_knowledge.py
