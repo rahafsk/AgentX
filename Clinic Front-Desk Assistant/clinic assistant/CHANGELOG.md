@@ -28,6 +28,10 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 - Add DoctorRepository to retrieve doctors by ID and list active doctors.
 - Add `ClinicKnowledgeService` for grounded clinic-information answers from approved documents, including source citations, an honest no-evidence fallback, and refusal/screening of diagnosis or treatment advice.
 
+### Changed
+
+- Clarify that the Compose-only `db` hostname cannot be used by database commands running directly on the host, and provide an actionable initialization error.
+
 ### In progress
 
 - The embedding host must provide trusted owner and staff authentication resolvers; authentication-provider integration is not included here.

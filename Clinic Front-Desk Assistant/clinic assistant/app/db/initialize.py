@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from importlib import import_module
 from pathlib import Path
+from urllib.parse import urlsplit
 
 try:
     load_dotenv = import_module("dotenv").load_dotenv
@@ -86,9 +87,19 @@ def initialize_database(database_url: str | None = None) -> None:
         with postgres_saver.from_conn_string(dsn) as checkpointer:
             checkpointer.setup()
     except psycopg.Error as exc:
-        raise RuntimeError(
-            "PostgreSQL initialization failed; verify DATABASE_URL and the SQL scripts."
-        ) from exc
+        message = "PostgreSQL initialization failed; verify DATABASE_URL and the SQL scripts."
+        try:
+            database_host = urlsplit(dsn).hostname
+        except ValueError:
+            database_host = None
+        if database_host == "db" and "resolve host" in str(exc).lower():
+            message = (
+                "PostgreSQL initialization could not resolve host 'db'. That hostname is "
+                "available only inside Docker Compose. Run `docker compose up --build` to "
+                "initialize there, or use a host-reachable PostgreSQL URL (usually "
+                "127.0.0.1) when running this command directly."
+            )
+        raise RuntimeError(message) from exc
 
 
 def main() -> None:

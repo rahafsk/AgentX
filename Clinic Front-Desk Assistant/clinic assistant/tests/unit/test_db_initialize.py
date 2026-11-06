@@ -52,15 +52,23 @@ class _FakePsycopg(ModuleType):
     class Error(Exception):
         pass
 
-    def __init__(self, *, fail_connect: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_connect: bool = False,
+        error_message: str = "connection failed",
+        expected_dsn: str = "postgresql://test/clinic_test",
+    ) -> None:
         super().__init__("psycopg")
         self.connection = _FakeConnection()
         self.fail_connect = fail_connect
+        self.error_message = error_message
+        self.expected_dsn = expected_dsn
 
     def connect(self, dsn: str) -> _FakeConnection:
-        assert dsn == "postgresql://test/clinic_test"
+        assert dsn == self.expected_dsn
         if self.fail_connect:
-            raise self.Error("connection failed")
+            raise self.Error(self.error_message)
         return self.connection
 
 
@@ -166,6 +174,7 @@ def test_initializer_requires_database_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr(db_initialize, "load_dotenv", lambda *args, **kwargs: False)
 
     with pytest.raises(RuntimeError, match="DATABASE_URL must be set"):
         db_initialize.initialize_database()
@@ -181,3 +190,19 @@ def test_initializer_wraps_postgres_errors(
 
     with pytest.raises(RuntimeError, match="PostgreSQL initialization failed"):
         db_initialize.initialize_database("postgresql://test/clinic_test")
+
+
+def test_initializer_explains_compose_hostname_from_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_sql_files(tmp_path, monkeypatch)
+    fake_psycopg = _FakePsycopg(
+        fail_connect=True,
+        error_message="failed to resolve host 'db'",
+        expected_dsn="postgresql://test@db:5432/clinic_test",
+    )
+    monkeypatch.setattr(db_initialize, "import_module", _fake_import_module(fake_psycopg))
+
+    with pytest.raises(RuntimeError, match="available only inside Docker Compose"):
+        db_initialize.initialize_database("postgresql://test@db:5432/clinic_test")

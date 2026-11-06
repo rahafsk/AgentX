@@ -18,9 +18,11 @@ cd "Clinic Front-Desk Assistant/clinic assistant"
 uv sync --locked --extra dev
 ```
 
-## Run the current API
+## Run the current API directly on your host
 
 From the project directory (the one containing `pyproject.toml`):
+
+Copy `.env.example` to `.env` and set a local PostgreSQL password. Start PostgreSQL with `docker compose up -d db`. For the commands below, change the host in your local `.env` `DATABASE_URL` to `127.0.0.1` (or `localhost`), keeping the configured port, username, and database. The `db` hostname from the example is only resolvable inside Docker Compose. To keep `db` as the hostname, use `docker compose up --build` instead; Compose runs initialization for you.
 
 ```sh
 uv run python -m app.db.initialize
