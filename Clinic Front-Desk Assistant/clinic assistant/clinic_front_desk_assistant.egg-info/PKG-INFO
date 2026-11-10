@@ -12,6 +12,7 @@ Requires-Dist: psycopg[binary,pool]<4.0,>=3.2
 Requires-Dist: pydantic-settings<3.0,>=2.5
 Requires-Dist: python-dotenv<2.0,>=1.0
 Requires-Dist: httpx<1.0,>=0.27
+Requires-Dist: fastmcp>=4.1.7
 Provides-Extra: dev
 Requires-Dist: mypy<2.0,>=1.11; extra == "dev"
 Requires-Dist: pytest<9.0,>=8.0; extra == "dev"
@@ -39,9 +40,11 @@ cd "Clinic Front-Desk Assistant/clinic assistant"
 uv sync --locked --extra dev
 ```
 
-## Run the current API
+## Run the current API directly on your host
 
 From the project directory (the one containing `pyproject.toml`):
+
+Copy `.env.example` to `.env` and set a local PostgreSQL password. Start PostgreSQL with `docker compose up -d db`. For the commands below, change the host in your local `.env` `DATABASE_URL` to `127.0.0.1` (or `localhost`), keeping the configured port, username, and database. The `db` hostname from the example is only resolvable inside Docker Compose. To keep `db` as the hostname, use `docker compose up --build` instead; Compose runs initialization for you.
 
 ```sh
 uv run python -m app.db.initialize

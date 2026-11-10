@@ -6,6 +6,7 @@ psycopg[binary,pool]<4.0,>=3.2
 pydantic-settings<3.0,>=2.5
 python-dotenv<2.0,>=1.0
 httpx<1.0,>=0.27
+fastmcp>=4.1.7
 
 [dev]
 mypy<2.0,>=1.11
