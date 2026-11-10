@@ -6,6 +6,8 @@ Notable changes to the Clinic Front-Desk Assistant are recorded here. This proje
 
 ### Added
 
+- Add the initial MCP server/client scaffolds and the FastMCP dependency. The integration functions are placeholders for upcoming implementation.
+
 - Add owner-scoped conversation and appointment APIs with UUID idempotency keys, trusted caller identity, and checkpointed booking/cancellation actions.
 - Add staff approval queue and decision endpoints that update booking records and resume paused LangGraph threads.
 - Reject elapsed appointment slots and replay booking/approval actions safely after a database commit.
