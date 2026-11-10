@@ -1,5 +1,4 @@
 import asyncio
-from fastmcp import Client
 
 
 # ASILA - Booking Client
