@@ -1,14 +1,48 @@
 import asyncio
-
+from fastmcp import Client
 
 # ASILA - Booking Client
-async def connect_to_booking():
-    # TODO: Connect to Booking MCP Server
-    # TODO: List available tools
-    # TODO: Call register_patient
-    # TODO: Call book_appointment
-    # TODO: Test booking errors
-    pass
+
+async def connect_to_booking() -> None:
+    async with Client("http://127.0.0.1:8001/mcp") as client:
+        tools = await client.list_tools()
+        print("Booking tools:", [tool.name for tool in tools])
+
+        registration = await client.call_tool(
+            "register_patient",
+            {"name": "Salim", "phone": "99112233"},
+        )
+        print(f"booking.register_patient -> {registration.data}")
+
+        booking_args = {
+            "patient_id": registration.data["patient_id"],
+            "doctor": "Dr. Huda",
+            "date": "2026-11-20",
+            "time": "10:30",
+        }
+
+        booking = await client.call_tool("book_appointment", booking_args)
+        print(f"booking.book_appointment -> {booking.data}")
+
+        duplicate = await client.call_tool("book_appointment", booking_args)
+        print(f"booking.book_appointment -> {duplicate.data}")
+
+        unknown_patient_args = booking_args.copy()
+        unknown_patient_args["patient_id"] = 999
+        unknown_patient_args["time"] = "11:00"
+        unknown_patient = await client.call_tool(
+            "book_appointment", unknown_patient_args
+        )
+        print(f"booking.book_appointment -> {unknown_patient.data}")
+        
+        second_booking_args = booking_args.copy()
+        second_booking_args["time"] = "11:30"
+
+        second_booking = await client.call_tool(
+            "book_appointment", second_booking_args
+        )
+        print(f"booking.book_appointment -> {second_booking.data}")
+
 
 
 # ZOZI - Pharmacy Client
