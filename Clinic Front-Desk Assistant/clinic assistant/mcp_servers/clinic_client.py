@@ -11,15 +11,54 @@ async def connect_to_booking():
     pass
 
 
-# ZOZI - Pharmacy Client
+# Alzulaikha - Pharmacy Client
+   
 async def connect_to_pharmacy():
-    # TODO: Connect to Pharmacy MCP Server
-    # TODO: List available tools
-    # TODO: Call view_inventory
-    # TODO: Call add_inventory
-    # TODO: Test invalid quantity
-    # TODO: Add new medicine and verify inventory
-    pass
+    from fastmcp import Client
+
+    print("\n=== PHARMACY CLIENT ===")
+
+    async with Client("http://127.0.0.1:8002/mcp") as client:
+
+        # List available tools
+        tools = await client.list_tools()
+
+        print("\nAvailable Pharmacy Tools:")
+        for tool in tools:
+            print(tool.name)
+
+        # Call view_inventory
+        result = await client.call_tool("view_inventory", {})
+        print("\nCurrent Inventory:")
+        print(result)
+
+        # Call add_inventory: add a new medicine
+        result = await client.call_tool(
+            "add_inventory",
+            {
+                "medicine": "Vitamin D",
+                "quantity": 20,
+            },
+        )
+        print("\nAdd New Medicine:")
+        print(result)
+
+        # Test invalid quantity
+        result = await client.call_tool(
+            "add_inventory",
+            {
+                "medicine": "Vitamin D",
+                "quantity": 0,
+            },
+        )
+        print("\nInvalid Quantity Test:")
+        print(result)
+
+        # Verify updated inventory
+        result = await client.call_tool("view_inventory", {})
+        print("\nUpdated Inventory:")
+        print(result)
+
 
 
 # SALWA - Reports Client
